@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import type {
   McpCallStatus,
+  McpCandidateRecord,
   McpKeywordSnapshot,
+  McpManualCostInput,
+  McpMarginSnapshot,
   McpPredictionSnapshot,
   McpProductSnapshot,
   McpToolCallResult,
@@ -25,8 +28,19 @@ type FieldItem = {
 };
 
 type SectionKey = 'asin_detail' | 'asin_prediction' | 'traffic_keyword_stat' | 'keyword_miner';
+type CostInputKey = keyof McpManualCostInput;
 
 const defaultKeyword = 'easter eggs fillers';
+const candidatesStorageKey = 'amazon-sellersprite-selector:mcp-candidates';
+const defaultCostInputs: Record<CostInputKey, string> = {
+  target_discount_rate: '0.05',
+  referral_fee_rate: '0.15',
+  manual_fba_fee: '',
+  purchase_cost: '',
+  first_leg_shipping: '',
+  packaging_cost: '',
+  other_cost: '',
+};
 
 const emptyResult: McpValidationResult = {
   asin: 'B0GJSCQ3PS',
@@ -64,6 +78,28 @@ function formatMoney(value: number | null | undefined): string {
 function formatPercent(value: number | null | undefined): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '未返回';
   return `${(value * 100).toFixed(1)}%`;
+}
+
+function parseInputNumber(value: string): number | null {
+  if (value.trim() === '') return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function readCostInputs(inputs: Record<CostInputKey, string>): McpManualCostInput {
+  return {
+    target_discount_rate: parseInputNumber(inputs.target_discount_rate),
+    referral_fee_rate: parseInputNumber(inputs.referral_fee_rate),
+    manual_fba_fee: parseInputNumber(inputs.manual_fba_fee),
+    purchase_cost: parseInputNumber(inputs.purchase_cost),
+    first_leg_shipping: parseInputNumber(inputs.first_leg_shipping),
+    packaging_cost: parseInputNumber(inputs.packaging_cost),
+    other_cost: parseInputNumber(inputs.other_cost),
+  };
+}
+
+function costValue(value: number | null): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 function hasValue(value: unknown): boolean {
@@ -151,6 +187,58 @@ function buildPriceDiagnostics(product: McpProductSnapshot | null): Array<{ labe
   });
 }
 
+function calculateMarginSnapshot(product: McpProductSnapshot | null, costs: McpManualCostInput): McpMarginSnapshot {
+  const warnings: string[] = [];
+  const basePrice = product?.coupon_price ?? product?.price ?? null;
+  const targetDiscountRate = costs.target_discount_rate ?? 0.05;
+  const referralFeeRate = costs.referral_fee_rate ?? 0.15;
+  const fbaFee = costs.manual_fba_fee ?? product?.fba_fee ?? null;
+
+  if (typeof basePrice !== 'number') warnings.push('缺少 price，无法计算目标售价和毛利率。');
+  if (typeof fbaFee !== 'number') warnings.push('FBA费用未返回，需人工补充后才能计算完整平台后毛利率。');
+  if (costs.purchase_cost === null) warnings.push('采购价未录入，最终毛利率会偏高。');
+  if (costs.first_leg_shipping === null) warnings.push('头程费用未录入，最终毛利率会偏高。');
+  if (costs.packaging_cost === null) warnings.push('包装费用未录入，最终毛利率会偏高。');
+
+  const targetPrice = typeof basePrice === 'number' ? basePrice * (1 - targetDiscountRate) : null;
+  const referralFee = typeof targetPrice === 'number' ? targetPrice * referralFeeRate : null;
+  const productFullCost =
+    costValue(costs.purchase_cost) +
+    costValue(costs.first_leg_shipping) +
+    costValue(costs.packaging_cost) +
+    costValue(costs.other_cost);
+
+  const platformMarginRate =
+    typeof targetPrice === 'number' && typeof referralFee === 'number' && typeof fbaFee === 'number' && targetPrice > 0
+      ? (targetPrice - referralFee - fbaFee) / targetPrice
+      : null;
+
+  const finalMarginRate =
+    typeof targetPrice === 'number' && typeof referralFee === 'number' && typeof fbaFee === 'number' && targetPrice > 0
+      ? (targetPrice - referralFee - fbaFee - productFullCost) / targetPrice
+      : null;
+
+  return {
+    base_price: basePrice,
+    target_price: targetPrice,
+    referral_fee: referralFee,
+    fba_fee: fbaFee,
+    platform_margin_rate: platformMarginRate,
+    product_full_cost: productFullCost,
+    final_margin_rate: finalMarginRate,
+    platform_margin_pass: typeof platformMarginRate === 'number' ? platformMarginRate >= 0.6 : false,
+    final_margin_pass: typeof finalMarginRate === 'number' ? finalMarginRate >= 0.25 : false,
+    warnings,
+  };
+}
+
+function marginVerdict(margin: McpMarginSnapshot): string {
+  if (margin.platform_margin_rate === null || margin.final_margin_rate === null) return '缺少关键成本，暂不能判断。';
+  const platformText = margin.platform_margin_pass ? '平台后毛利率达到 60% 以上' : '平台后毛利率低于 60%';
+  const finalText = margin.final_margin_pass ? '最终毛利率达到 25% 以上' : '最终毛利率低于 25%';
+  return `${platformText}，${finalText}。`;
+}
+
 function diagnoseAdKeyword(keyword: McpKeywordSnapshot | null, keywordText: string): string[] {
   const missing: string[] = [];
   if (typeof keyword?.ppc_bid !== 'number') missing.push('ppc_bid');
@@ -200,11 +288,30 @@ function confirmMcpCall(): boolean {
   return window.confirm('本次将调用卖家精灵 MCP，可能消耗额度。是否继续？');
 }
 
+function loadCandidates(): McpCandidateRecord[] {
+  try {
+    const raw = window.localStorage.getItem(candidatesStorageKey);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCandidates(candidates: McpCandidateRecord[]) {
+  window.localStorage.setItem(candidatesStorageKey, JSON.stringify(candidates));
+}
+
 export default function McpValidationPage({ initialAsin }: { initialAsin?: string }) {
   const [asin, setAsin] = useState(initialAsin || 'B0GJSCQ3PS');
   const [keyword, setKeyword] = useState(defaultKeyword);
   const [result, setResult] = useState<McpValidationResult>({ ...emptyResult, asin: initialAsin || emptyResult.asin });
   const [sectionStatus, setSectionStatus] = useState<Record<SectionKey, McpCallStatus>>(createInitialSectionStatus);
+  const [costInputs, setCostInputs] = useState<Record<CostInputKey, string>>(defaultCostInputs);
+  const [notes, setNotes] = useState('');
+  const [candidates, setCandidates] = useState<McpCandidateRecord[]>(() => loadCandidates());
+  const [saveNotice, setSaveNotice] = useState('');
 
   useEffect(() => {
     if (initialAsin) {
@@ -221,6 +328,8 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
   const fieldItems = useMemo(() => buildFieldItems(mergedProduct, keywordData), [mergedProduct, keywordData]);
   const priceDiagnostics = useMemo(() => buildPriceDiagnostics(mergedProduct), [mergedProduct]);
   const adDiagnostics = useMemo(() => diagnoseAdKeyword(keywordData, keyword), [keywordData, keyword]);
+  const manualCosts = useMemo(() => readCostInputs(costInputs), [costInputs]);
+  const marginSnapshot = useMemo(() => calculateMarginSnapshot(mergedProduct, manualCosts), [manualCosts, mergedProduct]);
   const errors = resultErrors(result);
   const isLoading = Object.values(sectionStatus).some((status) => status === 'loading');
 
@@ -271,6 +380,35 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
     await runSection('asin_prediction', true);
     await runSection('traffic_keyword_stat', true);
     await runSection('keyword_miner', true);
+  };
+
+  const updateCostInput = (key: CostInputKey, value: string) => {
+    setCostInputs((current) => ({ ...current, [key]: value }));
+  };
+
+  const saveCandidate = () => {
+    const record: McpCandidateRecord = {
+      id: `${Date.now()}-${asin.trim() || 'unknown'}`,
+      asin: asin.trim(),
+      keyword: keyword.trim(),
+      saved_at: new Date().toISOString(),
+      product: mergedProduct,
+      keyword_snapshot: keywordData,
+      validation: result,
+      costs: manualCosts,
+      margin: marginSnapshot,
+      notes,
+    };
+    const nextCandidates = [record, ...candidates].slice(0, 50);
+    setCandidates(nextCandidates);
+    saveCandidates(nextCandidates);
+    setSaveNotice('已保存到本地候选记录。');
+  };
+
+  const deleteCandidate = (id: string) => {
+    const nextCandidates = candidates.filter((candidate) => candidate.id !== id);
+    setCandidates(nextCandidates);
+    saveCandidates(nextCandidates);
   };
 
   return (
@@ -393,6 +531,84 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
 
       <section className="content-section">
         <div className="section-heading">
+          <h2>人工成本与最终毛利</h2>
+          <p>录入采购、头程、包装等成本，计算平台后毛利率和最终毛利率。</p>
+        </div>
+        <div className="cost-layout">
+          <div className="cost-input-grid">
+            <CostInput label="目标降价比例" suffix="例：0.05" value={costInputs.target_discount_rate} onChange={(value) => updateCostInput('target_discount_rate', value)} />
+            <CostInput label="Referral Fee比例" suffix="默认 0.15" value={costInputs.referral_fee_rate} onChange={(value) => updateCostInput('referral_fee_rate', value)} />
+            <CostInput label="人工FBA费用" suffix="MCP未返回时填" value={costInputs.manual_fba_fee} onChange={(value) => updateCostInput('manual_fba_fee', value)} />
+            <CostInput label="采购价" suffix="单件成本" value={costInputs.purchase_cost} onChange={(value) => updateCostInput('purchase_cost', value)} />
+            <CostInput label="头程费用" suffix="单件分摊" value={costInputs.first_leg_shipping} onChange={(value) => updateCostInput('first_leg_shipping', value)} />
+            <CostInput label="包装费用" suffix="单件分摊" value={costInputs.packaging_cost} onChange={(value) => updateCostInput('packaging_cost', value)} />
+            <CostInput label="其他成本" suffix="贴标/损耗等" value={costInputs.other_cost} onChange={(value) => updateCostInput('other_cost', value)} />
+          </div>
+          <div className="margin-panel">
+            <div className="margin-kpis">
+              <Metric label="原始售价" value={formatMoney(marginSnapshot.base_price)} />
+              <Metric label="目标售价" value={formatMoney(marginSnapshot.target_price)} />
+              <Metric label="平台佣金" value={formatMoney(marginSnapshot.referral_fee)} />
+              <Metric label="FBA费用" value={formatMoney(marginSnapshot.fba_fee)} />
+              <Metric label="商品全成本" value={formatMoney(marginSnapshot.product_full_cost)} />
+              <Metric label="平台后毛利率" value={formatPercent(marginSnapshot.platform_margin_rate)} tone={marginSnapshot.platform_margin_pass ? 'good' : 'warn'} />
+              <Metric label="最终毛利率" value={formatPercent(marginSnapshot.final_margin_rate)} tone={marginSnapshot.final_margin_pass ? 'good' : 'warn'} />
+            </div>
+            <div className="margin-verdict">{marginVerdict(marginSnapshot)}</div>
+            {marginSnapshot.warnings.length > 0 && (
+              <div className="warning-list">
+                {marginSnapshot.warnings.map((warning) => (
+                  <p key={warning}>{warning}</p>
+                ))}
+              </div>
+            )}
+            <label className="notes-field">
+              <span>候选备注</span>
+              <textarea value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="记录供应商、风险点、前台复核结论等" />
+            </label>
+            <button className="primary-button" type="button" onClick={saveCandidate}>
+              保存为候选记录
+            </button>
+            {saveNotice && <p className="save-notice">{saveNotice}</p>}
+          </div>
+        </div>
+      </section>
+
+      <section className="content-section">
+        <div className="section-heading">
+          <h2>本地候选记录</h2>
+          <p>只保存在当前浏览器本地，用于小样本验证沉淀；不会触发 MCP 调用。</p>
+        </div>
+        {candidates.length ? (
+          <div className="candidate-list">
+            {candidates.map((candidate) => (
+              <div className="candidate-card" key={candidate.id}>
+                <div>
+                  <strong>{candidate.asin || '未填写 ASIN'}</strong>
+                  <span>{candidate.keyword || '未填写关键词'}</span>
+                  <small>{new Date(candidate.saved_at).toLocaleString()}</small>
+                </div>
+                <div className="candidate-metrics">
+                  <Metric label="目标价" value={formatMoney(candidate.margin.target_price)} />
+                  <Metric label="平台后毛利" value={formatPercent(candidate.margin.platform_margin_rate)} tone={candidate.margin.platform_margin_pass ? 'good' : 'warn'} />
+                  <Metric label="最终毛利" value={formatPercent(candidate.margin.final_margin_rate)} tone={candidate.margin.final_margin_pass ? 'good' : 'warn'} />
+                  <Metric label="月销量" value={valueLabel(candidate.product?.monthly_sales)} />
+                  <Metric label="评论数" value={valueLabel(candidate.product?.review_count)} />
+                </div>
+                {candidate.notes && <p className="candidate-notes">{candidate.notes}</p>}
+                <button className="secondary-button" type="button" onClick={() => deleteCandidate(candidate.id)}>
+                  删除
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="empty-state">暂无候选记录。完成小样本验证和成本录入后，可以手动保存。</div>
+        )}
+      </section>
+
+      <section className="content-section">
+        <div className="section-heading">
           <h2>ASIN详情标准化字段</h2>
         </div>
         <SnapshotGrid snapshot={result.asin_detail?.data ?? null} fields={productFields} />
@@ -478,6 +694,24 @@ const keywordFields: Array<[keyof McpKeywordSnapshot, string]> = [
   ['spr', 'SPR'],
   ['click_concentration', '点击集中度'],
 ];
+
+function CostInput({ label, suffix, value, onChange }: { label: string; suffix: string; value: string; onChange: (value: string) => void }) {
+  return (
+    <label>
+      <span>{label}</span>
+      <input type="number" min="0" step="0.01" value={value} onChange={(event) => onChange(event.target.value)} placeholder={suffix} />
+    </label>
+  );
+}
+
+function Metric({ label, value, tone }: { label: string; value: string; tone?: 'good' | 'warn' }) {
+  return (
+    <div className={`metric ${tone ? `metric-${tone}` : ''}`}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
 
 function SnapshotGrid<T extends object>({ snapshot, fields }: { snapshot: T | null; fields: Array<[keyof T, string]> }) {
   if (!snapshot) return <div className="empty-state">暂未返回数据。</div>;

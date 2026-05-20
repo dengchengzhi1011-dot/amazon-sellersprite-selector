@@ -19,7 +19,8 @@ body {
 }
 
 button,
-input {
+input,
+textarea {
   font: inherit;
 }
 
@@ -213,9 +214,9 @@ label {
   font-weight: 700;
 }
 
-input {
+input,
+textarea {
   width: 100%;
-  min-height: 42px;
   border: 1px solid #cfd7df;
   border-radius: 8px;
   background: #ffffff;
@@ -223,7 +224,17 @@ input {
   padding: 10px 12px;
 }
 
-input:focus {
+input {
+  min-height: 42px;
+}
+
+textarea {
+  min-height: 88px;
+  resize: vertical;
+}
+
+input:focus,
+textarea:focus {
   border-color: #2d6f75;
   outline: 3px solid rgba(45, 111, 117, 0.16);
 }
@@ -395,6 +406,114 @@ input:focus {
   color: #4c5965;
 }
 
+.cost-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.9fr) minmax(320px, 1.1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.cost-input-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.margin-panel,
+.candidate-card {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #e0e6eb;
+  border-radius: 8px;
+  background: #fbfcfd;
+  padding: 14px;
+}
+
+.margin-kpis,
+.candidate-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 10px;
+}
+
+.metric {
+  display: grid;
+  gap: 5px;
+  border: 1px solid #e1e6eb;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 10px;
+}
+
+.metric span {
+  color: #687380;
+  font-size: 12px;
+}
+
+.metric strong {
+  color: #1f2a35;
+  overflow-wrap: anywhere;
+}
+
+.metric-good {
+  border-color: #b8e0c6;
+  background: #f0fbf3;
+}
+
+.metric-warn {
+  border-color: #f0d8a7;
+  background: #fff8e8;
+}
+
+.margin-verdict {
+  border-radius: 8px;
+  background: #edf7f6;
+  color: #28464c;
+  padding: 10px 12px;
+  font-weight: 800;
+}
+
+.warning-list {
+  border-radius: 8px;
+  background: #fff5ec;
+  color: #7b4b10;
+  padding: 10px 12px;
+}
+
+.warning-list p,
+.save-notice,
+.candidate-notes {
+  margin-bottom: 0;
+}
+
+.notes-field {
+  margin-top: 2px;
+}
+
+.save-notice {
+  color: #19633a;
+  font-weight: 800;
+}
+
+.candidate-list {
+  display: grid;
+  gap: 12px;
+}
+
+.candidate-card > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.candidate-card > div:first-child span,
+.candidate-card > div:first-child small {
+  color: #687380;
+}
+
+.candidate-notes {
+  color: #4c5965;
+}
+
 .table-wrap {
   overflow-x: auto;
 }
@@ -478,6 +597,8 @@ pre {
   .page-header,
   .input-grid,
   .diagnosis-grid,
+  .cost-layout,
+  .cost-input-grid,
   .status-grid {
     grid-template-columns: 1fr;
   }

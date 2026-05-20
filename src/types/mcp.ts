@@ -76,3 +76,39 @@ export interface McpValidationResult {
   keyword_miner: McpToolCallResult<McpKeywordSnapshot> | null;
   errors: string[];
 }
+
+export interface McpManualCostInput {
+  target_discount_rate: NullableNumber;
+  referral_fee_rate: NullableNumber;
+  manual_fba_fee: NullableNumber;
+  purchase_cost: NullableNumber;
+  first_leg_shipping: NullableNumber;
+  packaging_cost: NullableNumber;
+  other_cost: NullableNumber;
+}
+
+export interface McpMarginSnapshot {
+  base_price: NullableNumber;
+  target_price: NullableNumber;
+  referral_fee: NullableNumber;
+  fba_fee: NullableNumber;
+  platform_margin_rate: NullableNumber;
+  product_full_cost: NullableNumber;
+  final_margin_rate: NullableNumber;
+  platform_margin_pass: boolean;
+  final_margin_pass: boolean;
+  warnings: string[];
+}
+
+export interface McpCandidateRecord {
+  id: string;
+  asin: string;
+  keyword: string;
+  saved_at: string;
+  product: McpProductSnapshot | null;
+  keyword_snapshot: McpKeywordSnapshot | null;
+  validation: McpValidationResult;
+  costs: McpManualCostInput;
+  margin: McpMarginSnapshot;
+  notes: string;
+}
