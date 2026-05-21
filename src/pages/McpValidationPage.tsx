@@ -463,6 +463,25 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
     saveCandidates(nextCandidates);
   };
 
+  const updateCandidate = (id: string) => {
+    const savedProduct = saveBackToProduct(true);
+    const replacement = createCandidateRecord({
+      asin: asin.trim(),
+      keyword: keyword.trim(),
+      product: savedProduct,
+      validation: result,
+      costs: manualCosts,
+      margin: marginSnapshot,
+      notes,
+    });
+    const nextCandidates = candidates.map((candidate) =>
+      candidate.id === id ? { ...replacement, id, saved_at: new Date().toISOString() } : candidate,
+    );
+    setCandidates(nextCandidates);
+    saveCandidates(nextCandidates);
+    setSaveNotice('已更新候选记录和商品评分。');
+  };
+
   const exportCandidateRecords = () => {
     const csv = exportCandidatesCsv(candidates);
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
@@ -681,9 +700,14 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
                   <Metric label="评论数" value={valueLabel(candidate.product?.review_count)} />
                 </div>
                 {candidate.notes && <p className="candidate-notes">{candidate.notes}</p>}
-                <button className="secondary-button" type="button" onClick={() => deleteCandidate(candidate.id)}>
-                  删除
-                </button>
+                <div className="action-row compact-actions">
+                  <button className="secondary-button" type="button" onClick={() => updateCandidate(candidate.id)}>
+                    用当前验证更新
+                  </button>
+                  <button className="secondary-button" type="button" onClick={() => deleteCandidate(candidate.id)}>
+                    删除
+                  </button>
+                </div>
               </div>
             ))}
           </div>
