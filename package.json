@@ -4,16 +4,19 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node scripts/dev-with-bridge.mjs",
+    "dev:ui": "vite",
+    "bridge": "node scripts/sellersprite-bridge.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@vitejs/plugin-react": "^4.3.4",
-    "typescript": "^5.9.3",
-    "vite": "^4.5.5",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "typescript": "^5.9.3",
+    "vite": "^4.5.5"
   },
   "devDependencies": {
     "@types/react": "^18.3.27",

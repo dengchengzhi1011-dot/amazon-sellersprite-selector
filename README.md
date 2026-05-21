@@ -16,16 +16,33 @@ Amazon 铺货 / 精铺选品工具，第一版聚焦「MCP 单品验证」。
 - MCP 回填商品：手动把单品验证结果保存到当前商品或候选商品。
 - 铺货捡漏评分：按低评论出单、价格压制、全成本毛利、低竞价广告、安全风险重新打分。
 - 商品详情对比：保留 Excel 原始数据和 MCP 最新数据，并显示关键字段差异。
+- 前台复核闭环：人工记录价格、评论变体、页面弱点、竞争风险和广告切入点。
+- 最终决策卡片：合并 Excel 初筛、MCP 复核、前台复核和利润测算，输出开发、小测、等待或放弃。
 
 ## MCP 接入说明
 
-前端默认不会批量请求 MCP。`src/utils/sellerspriteMcp.ts` 会优先寻找：
+前端默认不会批量请求 MCP。单次查询默认走本地桥接：
+
+1. `npm run dev` 会同时启动页面和 `scripts/sellersprite-bridge.mjs`。
+2. 本地桥接默认读取当前电脑的 `~/.codex/config.toml` 中 `sellersprite-mcp` 配置。
+3. 前端只访问 `/api/sellersprite/call`，不会拿到卖家精灵授权头。
+
+浏览器查询封装仍保留其他接入方式，会按顺序寻找：
 
 1. `window.__SELLERSPRITE_MCP__`
 2. `window.sellerspriteMcp`
 3. `VITE_SELLERSPRITE_MCP_ENDPOINT`
+4. 本地 `/api/sellersprite/call`
 
-没有桥接时，页面会显示清晰错误，不会崩溃。
+如果桥接没有启动、Codex 中没有卖家精灵 MCP 配置，或授权失效，页面会显示清晰错误，不会崩溃。
+
+也可以用环境变量覆盖本地配置：
+
+```bash
+SELLERSPRITE_MCP_URL="https://mcp.sellersprite.com/mcp" \
+SELLERSPRITE_MCP_SECRET_KEY="你的 secret-key" \
+npm run dev
+```
 
 ## 本地运行
 

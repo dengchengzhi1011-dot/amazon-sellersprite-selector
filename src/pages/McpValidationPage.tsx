@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import type {
+  KeywordSnapshot,
   McpCallStatus,
   McpCandidateRecord,
   McpKeywordSnapshot,
@@ -26,6 +27,12 @@ import {
   saveCandidates,
   upsertProductMcpData,
 } from '../utils/productStore';
+import {
+  calculateLongTailOpportunity,
+  generateLongTailKeywordCandidates,
+  longTailOpportunityLabel,
+  normalizeKeywordSnapshot,
+} from '../utils/keywordTools';
 
 type FieldStatus = '可用' | '未返回' | '需要人工补充' | '需要前台复核';
 type FieldItem = {
@@ -66,6 +73,9 @@ const defaultCostInputs: Record<CostInputKey, string> = {
 const emptyResult: McpValidationResult = {
   asin: 'B0GJSCQ3PS',
   keyword: defaultKeyword,
+  main_keyword: defaultKeyword,
+  long_tail_keywords: [],
+  keyword_snapshots: [],
   status: 'idle',
   checked_at: '',
   asin_detail: null,
@@ -151,6 +161,8 @@ function getMergedProduct(product: McpProductSnapshot | null, prediction: McpPre
     monthly_sales: product?.monthly_sales ?? prediction?.recent_30d_sales ?? null,
     monthly_revenue: product?.monthly_revenue ?? prediction?.recent_30d_revenue ?? null,
     fba_fee: product?.fba_fee ?? null,
+    referral_fee: product?.referral_fee ?? null,
+    referral_fee_rate: product?.referral_fee_rate ?? null,
     seller: product?.seller ?? null,
     seller_type: product?.seller_type ?? null,
     variation_count: product?.variation_count ?? null,
@@ -222,6 +234,7 @@ function calculateMarginSnapshot(product: McpProductSnapshot | null, costs: McpM
 
   if (typeof basePrice !== 'number') warnings.push('缺少 price，无法计算目标售价和毛利率。');
   if (typeof fbaFee !== 'number') warnings.push('FBA费用未返回，需人工补充后才能计算完整平台后毛利率。');
+  if (typeof product?.referral_fee_rate !== 'number') warnings.push('佣金比例为系统默认估算，非 MCP 返回。');
   if (costs.purchase_cost === null) warnings.push('采购价未录入，最终毛利率会偏高。');
   if (costs.first_leg_shipping === null) warnings.push('头程费用未录入，最终毛利率会偏高。');
   if (costs.packaging_cost === null) warnings.push('包装费用未录入，最终毛利率会偏高。');
@@ -318,9 +331,52 @@ function confirmMcpCall(): boolean {
   return window.confirm('本次将调用卖家精灵 MCP，可能消耗额度。是否继续？');
 }
 
-export default function McpValidationPage({ initialAsin }: { initialAsin?: string }) {
+function parseLongTailKeywords(value: string): string[] {
+  return Array.from(
+    new Set(
+      value
+        .split(/\n+/)
+        .map((keyword) => keyword.trim())
+        .filter(Boolean),
+    ),
+  ).slice(0, 10);
+}
+
+function mergeKeywordSnapshots(current: KeywordSnapshot[], incoming: KeywordSnapshot[]): KeywordSnapshot[] {
+  const next = [...current];
+  incoming.forEach((snapshot) => {
+    const key = `${snapshot.keyword_type}:${snapshot.keyword?.trim().toLowerCase()}`;
+    const index = next.findIndex((item) => `${item.keyword_type}:${item.keyword?.trim().toLowerCase()}` === key);
+    if (index >= 0) next[index] = snapshot;
+    else next.push(snapshot);
+  });
+  return next.filter((snapshot) => snapshot.keyword).slice(-20);
+}
+
+export default function McpValidationPage({
+  initialAsin,
+  initialMainKeyword,
+  initialTitle,
+  initialCategory,
+  initialGenerateLongTail = false,
+  initialQueryLongTail = false,
+}: {
+  initialAsin?: string;
+  initialMainKeyword?: string;
+  initialTitle?: string;
+  initialCategory?: string;
+  initialGenerateLongTail?: boolean;
+  initialQueryLongTail?: boolean;
+}) {
   const [asin, setAsin] = useState(initialAsin || 'B0GJSCQ3PS');
-  const [keyword, setKeyword] = useState(defaultKeyword);
+  const [mainKeyword, setMainKeyword] = useState(defaultKeyword);
+  const [longTailText, setLongTailText] = useState('');
+  const [keywordSnapshots, setKeywordSnapshots] = useState<KeywordSnapshot[]>([]);
+  const [longTailSuggestions, setLongTailSuggestions] = useState<string[]>([]);
+  const [selectedSuggestions, setSelectedSuggestions] = useState<string[]>([]);
+  const [longTailLoading, setLongTailLoading] = useState(false);
+  const [keywordNotice, setKeywordNotice] = useState('');
+  const [pendingLongTailQuery, setPendingLongTailQuery] = useState(false);
   const [result, setResult] = useState<McpValidationResult>({ ...emptyResult, asin: initialAsin || emptyResult.asin });
   const [sectionStatus, setSectionStatus] = useState<Record<SectionKey, McpCallStatus>>(createInitialSectionStatus);
   const [costInputs, setCostInputs] = useState<Record<CostInputKey, string>>(defaultCostInputs);
@@ -330,19 +386,48 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
 
   useEffect(() => {
     if (initialAsin) {
+      const seededMainKeyword = initialMainKeyword?.trim() ?? '';
+      const generated = initialGenerateLongTail
+        ? generateLongTailKeywordCandidates({
+            title: initialTitle,
+            category: initialCategory,
+            main_keyword: seededMainKeyword,
+          })
+        : [];
+      const generatedLongTails = generated.filter((keyword) => keyword !== seededMainKeyword);
       setAsin(initialAsin);
-      setResult((current) => ({ ...current, asin: initialAsin }));
+      setMainKeyword(seededMainKeyword);
+      setLongTailText(generatedLongTails.join('\n'));
+      setKeywordSnapshots([]);
+      setLongTailSuggestions(generated);
+      setSelectedSuggestions(generatedLongTails);
+      setPendingLongTailQuery(initialQueryLongTail && generated.length > 0);
+      setResult((current) => ({ ...current, asin: initialAsin, keyword: seededMainKeyword, main_keyword: seededMainKeyword, long_tail_keywords: generatedLongTails, keyword_snapshots: [] }));
     }
-  }, [initialAsin]);
+  }, [initialAsin, initialCategory, initialGenerateLongTail, initialMainKeyword, initialQueryLongTail, initialTitle]);
 
   const mergedProduct = useMemo(
     () => getMergedProduct(result.asin_detail?.data ?? null, result.asin_prediction?.data ?? null),
     [result.asin_detail, result.asin_prediction],
   );
-  const keywordData = result.keyword_miner?.data ?? null;
+  const longTailKeywords = useMemo(() => parseLongTailKeywords(longTailText), [longTailText]);
+  const activeKeywordSnapshots = useMemo(
+    () =>
+      keywordSnapshots.filter((snapshot) => {
+        const keyword = snapshot.keyword?.trim().toLowerCase();
+        if (!keyword) return false;
+        if (snapshot.keyword_type === 'main') return keyword === mainKeyword.trim().toLowerCase();
+        return longTailKeywords.some((longTailKeyword) => longTailKeyword.trim().toLowerCase() === keyword);
+      }),
+    [keywordSnapshots, longTailKeywords, mainKeyword],
+  );
+  const keywordData =
+    activeKeywordSnapshots.find((snapshot) => snapshot.keyword_type === 'main' && !snapshot.error) ??
+    (result.keyword_miner?.data?.keyword?.trim().toLowerCase() === mainKeyword.trim().toLowerCase() ? result.keyword_miner.data : null);
   const fieldItems = useMemo(() => buildFieldItems(mergedProduct, keywordData), [mergedProduct, keywordData]);
   const priceDiagnostics = useMemo(() => buildPriceDiagnostics(mergedProduct), [mergedProduct]);
-  const adDiagnostics = useMemo(() => diagnoseAdKeyword(keywordData, keyword), [keywordData, keyword]);
+  const adDiagnostics = useMemo(() => diagnoseAdKeyword(keywordData, mainKeyword), [keywordData, mainKeyword]);
+  const longTailOpportunity = useMemo(() => calculateLongTailOpportunity(activeKeywordSnapshots), [activeKeywordSnapshots]);
   const manualCosts = useMemo(() => readCostInputs(costInputs), [costInputs]);
   const marginSnapshot = useMemo(() => calculateMarginSnapshot(mergedProduct, manualCosts), [manualCosts, mergedProduct]);
   const errors = resultErrors(result);
@@ -352,13 +437,35 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
     setResult((current) => ({
       ...current,
       asin,
-      keyword,
+      keyword: mainKeyword,
+      main_keyword: mainKeyword,
+      long_tail_keywords: longTailKeywords,
+      keyword_snapshots: keywordSnapshots,
       checked_at: new Date().toISOString(),
       ...patch,
     }));
   };
 
+  const saveKeywordSnapshotsToResult = (incoming: KeywordSnapshot[]) => {
+    setKeywordSnapshots((current) => {
+      const next = mergeKeywordSnapshots(current, incoming);
+      setResult((resultCurrent) => ({
+        ...resultCurrent,
+        asin,
+        keyword: mainKeyword,
+        main_keyword: mainKeyword,
+        long_tail_keywords: longTailKeywords,
+        keyword_snapshots: next,
+      }));
+      return next;
+    });
+  };
+
   const runSection = async (section: SectionKey, skipConfirm = false) => {
+    if (section === 'keyword_miner' && !mainKeyword.trim()) {
+      setKeywordNotice('未填写主关键词，已跳过主关键词数据查询。');
+      return;
+    }
     if (!skipConfirm && !confirmMcpCall()) return;
     setSectionStatus((current) => ({ ...current, [section]: 'loading' }));
     updateResult({ status: 'loading' });
@@ -367,13 +474,26 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
     if (section === 'asin_detail') callResult = await fetchAsinDetail(asin);
     else if (section === 'asin_prediction') callResult = await fetchAsinPrediction(asin);
     else if (section === 'traffic_keyword_stat') callResult = await fetchTrafficKeywordStat(asin);
-    else callResult = await fetchKeywordMiner(keyword);
+    else callResult = await fetchKeywordMiner(mainKeyword);
 
     setSectionStatus((current) => ({ ...current, [section]: callResult.status }));
+    if (section === 'keyword_miner') {
+      saveKeywordSnapshotsToResult([
+        normalizeKeywordSnapshot(
+          mainKeyword,
+          'main',
+          callResult.status === 'success' ? (callResult.data as McpKeywordSnapshot | null) : null,
+          callResult.error,
+          callResult.checked_at,
+        ),
+      ]);
+    }
     setResult((current) => ({
       ...current,
       asin,
-      keyword,
+      keyword: mainKeyword,
+      main_keyword: mainKeyword,
+      long_tail_keywords: longTailKeywords,
       checked_at: new Date().toISOString(),
       status: callResult.status === 'success' ? 'success' : callResult.status,
       [section]: callResult,
@@ -383,30 +503,124 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
 
   const runAll = async () => {
     if (!confirmMcpCall()) return;
-    setResult({ ...emptyResult, asin, keyword, status: 'loading', checked_at: new Date().toISOString() });
+    setResult({ ...emptyResult, asin, keyword: mainKeyword, main_keyword: mainKeyword, long_tail_keywords: longTailKeywords, keyword_snapshots: keywordSnapshots, status: 'loading', checked_at: new Date().toISOString() });
     setSectionStatus({
       asin_detail: 'loading',
       asin_prediction: 'loading',
       traffic_keyword_stat: 'loading',
-      keyword_miner: 'loading',
+      keyword_miner: mainKeyword.trim() ? 'loading' : 'idle',
     });
 
     await runSection('asin_detail', true);
     await runSection('asin_prediction', true);
     await runSection('traffic_keyword_stat', true);
-    await runSection('keyword_miner', true);
+    if (mainKeyword.trim()) await runSection('keyword_miner', true);
+    if (longTailKeywords.length) await queryLongTailKeywords();
+    if (!mainKeyword.trim() && !longTailKeywords.length) setKeywordNotice('未填写关键词，已跳过关键词数据查询。');
   };
+
+  const queryLongTailKeywords = async () => {
+    const keywords = longTailKeywords.slice(0, 10);
+    if (!keywords.length) {
+      setKeywordNotice('请先填写或勾选长尾关键词。');
+      return;
+    }
+    if (!window.confirm(`本次将查询 ${keywords.length} 个关键词，可能消耗 MCP 额度，是否继续？`)) return;
+    setLongTailLoading(true);
+    setKeywordNotice('');
+    const snapshots: KeywordSnapshot[] = [];
+    for (const longTailKeyword of keywords) {
+      const result = await fetchKeywordMiner(longTailKeyword);
+      const keywordType = selectedSuggestions.includes(longTailKeyword) ? 'auto_generated' : 'manual';
+      snapshots.push(
+        normalizeKeywordSnapshot(
+          longTailKeyword,
+          keywordType,
+          result.status === 'success' ? result.data : null,
+          result.error,
+          result.checked_at,
+        ),
+      );
+    }
+    saveKeywordSnapshotsToResult(snapshots);
+    setLongTailLoading(false);
+    const failed = snapshots.filter((snapshot) => snapshot.error).length;
+    setKeywordNotice(failed ? `长尾词查询完成，其中 ${failed} 个未成功，其余结果已保留。` : `已查询 ${snapshots.length} 个长尾关键词。`);
+  };
+
+  const queryAllKeywords = async () => {
+    if (!mainKeyword.trim() && !longTailKeywords.length) {
+      setKeywordNotice('未填写关键词，已跳过关键词数据查询。');
+      if (!confirmMcpCall()) return;
+      await runSection('asin_detail', true);
+      await runSection('asin_prediction', true);
+      await runSection('traffic_keyword_stat', true);
+      return;
+    }
+    if (mainKeyword.trim()) await runSection('keyword_miner');
+    if (longTailKeywords.length) await queryLongTailKeywords();
+  };
+
+  const generateSuggestions = () => {
+    const savedProduct = loadProducts().find((product) => product.asin === asin.trim());
+    const generated = generateLongTailKeywordCandidates({
+      title: mergedProduct?.title ?? savedProduct?.mcp_snapshot?.title ?? savedProduct?.excel.title ?? null,
+      category: mergedProduct?.category ?? savedProduct?.mcp_snapshot?.category ?? savedProduct?.excel.category ?? null,
+      brand: mergedProduct?.brand ?? savedProduct?.mcp_snapshot?.brand ?? savedProduct?.excel.brand ?? null,
+      main_keyword: mainKeyword,
+    });
+    setLongTailSuggestions(generated);
+    setSelectedSuggestions([]);
+    setKeywordNotice(generated.length ? '已根据当前 ASIN 标题和类目生成长尾词建议，可勾选加入列表。' : '当前标题信息不足，暂未生成长尾词建议。');
+  };
+
+  const toggleSuggestion = (keyword: string, checked: boolean) => {
+    setSelectedSuggestions((current) => checked ? Array.from(new Set([...current, keyword])).slice(0, 10) : current.filter((item) => item !== keyword));
+    if (checked) setLongTailText((current) => parseLongTailKeywords(`${current}\n${keyword}`).join('\n'));
+    else setLongTailText((current) => parseLongTailKeywords(current).filter((item) => item !== keyword).join('\n'));
+  };
+
+  const clearLongTailKeywords = () => {
+    setLongTailText('');
+    setLongTailSuggestions([]);
+    setSelectedSuggestions([]);
+    const next = keywordSnapshots.filter((snapshot) => snapshot.keyword_type === 'main');
+    setKeywordSnapshots(next);
+    setResult((current) => ({ ...current, long_tail_keywords: [], keyword_snapshots: next }));
+    setKeywordNotice('长尾关键词已清空。');
+  };
+
+  const changeAsin = (value: string) => {
+    setAsin(value);
+    setMainKeyword('');
+    setLongTailText('');
+    setLongTailSuggestions([]);
+    setSelectedSuggestions([]);
+    setKeywordSnapshots([]);
+    setKeywordNotice('已切换 ASIN，已清空上一条商品的关键词。');
+    setResult({ ...emptyResult, asin: value, keyword: '', main_keyword: '', long_tail_keywords: [], keyword_snapshots: [] });
+    setSectionStatus(createInitialSectionStatus());
+  };
+
+  useEffect(() => {
+    if (!pendingLongTailQuery || !longTailKeywords.length || longTailLoading) return;
+    setPendingLongTailQuery(false);
+    void queryLongTailKeywords();
+  }, [longTailKeywords, longTailLoading, pendingLongTailQuery]);
 
   const updateCostInput = (key: CostInputKey, value: string) => {
     setCostInputs((current) => ({ ...current, [key]: value }));
   };
 
   const buildMcpSnapshot = () => {
-    const hasSuccessData = result.asin_detail?.data || result.asin_prediction?.data || result.keyword_miner?.data || result.traffic_keyword_stat?.data;
+    const hasSuccessData = result.asin_detail?.data || result.asin_prediction?.data || result.keyword_miner?.data || result.traffic_keyword_stat?.data || activeKeywordSnapshots.length;
     if (!hasSuccessData) return null;
     return createMcpSnapshotFromValidation({
       product: mergedProduct,
       keyword: keywordData,
+      mainKeyword,
+      longTailKeywords,
+      keywordSnapshots: activeKeywordSnapshots,
       prediction: result.asin_prediction?.data ?? null,
       traffic: result.traffic_keyword_stat?.data ?? result.traffic_keyword_stat?.raw ?? null,
       asin: asin.trim(),
@@ -444,7 +658,7 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
     const savedProduct = saveBackToProduct(true);
     const record = createCandidateRecord({
       asin: asin.trim(),
-      keyword: keyword.trim(),
+      keyword: mainKeyword.trim(),
       product: savedProduct,
       validation: result,
       costs: manualCosts,
@@ -467,7 +681,7 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
     const savedProduct = saveBackToProduct(true);
     const replacement = createCandidateRecord({
       asin: asin.trim(),
-      keyword: keyword.trim(),
+      keyword: mainKeyword.trim(),
       product: savedProduct,
       validation: result,
       costs: manualCosts,
@@ -498,18 +712,38 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
       <section className="content-section">
         <div className="section-heading">
           <h2>MCP 单品验证</h2>
-          <p>只做单 ASIN 和单关键词手动查询，避免高频调用和额度消耗。</p>
+          <p>只做单 ASIN 手动查询。广告机会分开看主关键词和多个长尾词，避免只盯一个大词。</p>
         </div>
         <div className="input-grid">
           <label>
             <span>ASIN</span>
-            <input value={asin} onChange={(event) => setAsin(event.target.value)} placeholder="输入 ASIN" />
+            <input value={asin} onChange={(event) => changeAsin(event.target.value)} placeholder="输入 ASIN" />
           </label>
           <label>
-            <span>关键词</span>
-            <input value={keyword} onChange={(event) => setKeyword(event.target.value)} placeholder="输入关键词" />
+            <span>主关键词</span>
+            <input value={mainKeyword} onChange={(event) => setMainKeyword(event.target.value)} placeholder="产品最核心的大词/类目词" />
+            <small>产品最核心的大词/类目词，用于判断市场和主需求。</small>
+          </label>
+          <label className="keyword-textarea">
+            <span>长尾关键词列表</span>
+            <textarea value={longTailText} onChange={(event) => setLongTailText(parseLongTailKeywords(event.target.value).join('\n'))} placeholder="一行一个长尾词，单次最多 10 个" />
           </label>
         </div>
+        {longTailSuggestions.length > 0 && (
+          <div className="keyword-suggestion-box">
+            <strong>自动生成的长尾词建议</strong>
+            <div className="keyword-suggestion-grid">
+              {longTailSuggestions.map((suggestion) => (
+                <Check
+                  key={suggestion}
+                  label={suggestion}
+                  checked={selectedSuggestions.includes(suggestion)}
+                  onChange={(checked) => toggleSuggestion(suggestion, checked)}
+                />
+              ))}
+            </div>
+          </div>
+        )}
         <div className="action-row">
           <button type="button" onClick={() => runSection('asin_detail')} disabled={isLoading}>
             查询 ASIN 详情
@@ -521,12 +755,25 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
             查询 ASIN 流量关键词统计
           </button>
           <button type="button" onClick={() => runSection('keyword_miner')} disabled={isLoading}>
-            查询关键词数据
+            查询主关键词数据
+          </button>
+          <button type="button" onClick={queryLongTailKeywords} disabled={isLoading || longTailLoading}>
+            {longTailLoading ? '长尾词查询中' : '查询长尾关键词数据'}
+          </button>
+          <button type="button" onClick={queryAllKeywords} disabled={isLoading || longTailLoading}>
+            一键查询全部关键词
+          </button>
+          <button type="button" onClick={generateSuggestions} disabled={isLoading}>
+            自动生成长尾词建议
+          </button>
+          <button type="button" onClick={clearLongTailKeywords} disabled={isLoading || longTailLoading}>
+            清空长尾词
           </button>
           <button className="primary-button" type="button" onClick={runAll} disabled={isLoading}>
             一键小样本验证
           </button>
         </div>
+        {keywordNotice && <p className="save-notice">{keywordNotice}</p>}
         <div className="action-row">
           <button type="button" onClick={() => saveBackToProduct(false)}>
             保存到当前商品
@@ -618,6 +865,8 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
             {adDiagnostics.map((line) => (
               <p key={line}>{line}</p>
             ))}
+            <p>长尾词机会：{longTailOpportunityLabel(longTailOpportunity.level)}。</p>
+            <p>推荐低预算 SP 词：{longTailOpportunity.recommended_sp_keywords.join('、') || '待长尾词查询后确认'}。</p>
           </div>
         </div>
       </section>
@@ -689,17 +938,21 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
                 <div>
                   <strong>{candidate.asin || '未填写 ASIN'}</strong>
                   <span>{candidate.keyword || '未填写关键词'}</span>
-                  <span>{candidate.final_advice || '待复核'}</span>
+                  <span>前台复核：{candidate.front_review?.front_review_level || candidate.front_review_status || '未开始'}</span>
+                  <span>最终建议：{candidate.final_advice || '待复核'}</span>
+                  <span>负责人：{candidate.front_review?.reviewer || '未填写'}</span>
                   <small>{new Date(candidate.saved_at).toLocaleString()}</small>
                 </div>
                 <div className="candidate-metrics">
                   <Metric label="目标价" value={formatMoney(candidate.margin.target_price)} />
                   <Metric label="平台后毛利" value={formatPercent(candidate.margin.platform_margin_rate)} tone={candidate.margin.platform_margin_pass ? 'good' : 'warn'} />
                   <Metric label="最终毛利" value={formatPercent(candidate.margin.final_margin_rate)} tone={candidate.margin.final_margin_pass ? 'good' : 'warn'} />
+                  <Metric label="铺货捡漏分" value={valueLabel(candidate.flea_market_score)} />
+                  <Metric label="前台复核分" value={valueLabel(candidate.front_review?.front_review_score)} />
                   <Metric label="月销量" value={valueLabel(candidate.product?.monthly_sales)} />
                   <Metric label="评论数" value={valueLabel(candidate.product?.review_count)} />
                 </div>
-                {candidate.notes && <p className="candidate-notes">{candidate.notes}</p>}
+                {(candidate.notes || candidate.front_review?.notes) && <p className="candidate-notes">{candidate.notes || candidate.front_review?.notes}</p>}
                 <div className="action-row compact-actions">
                   <button className="secondary-button" type="button" onClick={() => updateCandidate(candidate.id)}>
                     用当前验证更新
@@ -739,9 +992,11 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
 
       <section className="content-section">
         <div className="section-heading">
-          <h2>关键词挖掘字段</h2>
+          <h2>关键词广告机会</h2>
+          <p>主词用于判断需求，长尾词用于找低预算 SP 捡漏入口。</p>
         </div>
         <SnapshotGrid snapshot={result.keyword_miner?.data ?? null} fields={keywordFields} />
+        <KeywordSnapshotTable snapshots={activeKeywordSnapshots} />
       </section>
 
       <section className="content-section">
@@ -753,6 +1008,7 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
           <RawBlock title="asin_prediction raw" raw={result.asin_prediction?.raw ?? null} />
           <RawBlock title="traffic_keyword_stat raw" raw={result.traffic_keyword_stat?.raw ?? null} />
           <RawBlock title="keyword_miner raw" raw={result.keyword_miner?.raw ?? null} />
+          <RawBlock title="keyword_snapshots raw" raw={activeKeywordSnapshots} />
         </div>
       </section>
     </div>
@@ -772,6 +1028,8 @@ const productFields: Array<[keyof McpProductSnapshot, string]> = [
   ['monthly_sales', '月销量'],
   ['monthly_revenue', '月销售额'],
   ['fba_fee', 'FBA费用'],
+  ['referral_fee', '平台佣金'],
+  ['referral_fee_rate', '佣金比例'],
   ['seller', '卖家'],
   ['seller_type', '卖家类型'],
   ['variation_count', '变体数'],
@@ -803,6 +1061,65 @@ const keywordFields: Array<[keyof McpKeywordSnapshot, string]> = [
   ['spr', 'SPR'],
   ['click_concentration', '点击集中度'],
 ];
+
+function Check({ label, checked, onChange }: { label: string; checked: boolean; onChange: (checked: boolean) => void }) {
+  return <label className="checkbox-label"><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />{label}</label>;
+}
+
+function KeywordSnapshotTable({ snapshots }: { snapshots: KeywordSnapshot[] }) {
+  if (!snapshots.length) return <div className="empty-state">暂未查询主词或长尾词数据。</div>;
+  return (
+    <div className="table-wrap keyword-table">
+      <table>
+        <thead>
+          <tr>
+            <th>关键词</th>
+            <th>类型</th>
+            <th>搜索量</th>
+            <th>PPC</th>
+            <th>购买率</th>
+            <th>广告竞品数</th>
+            <th>标题密度</th>
+            <th>判断</th>
+          </tr>
+        </thead>
+        <tbody>
+          {snapshots.map((snapshot) => (
+            <tr key={`${snapshot.keyword_type}-${snapshot.keyword}`}>
+              <td>{snapshot.keyword ?? '未返回'}</td>
+              <td>{keywordTypeLabel(snapshot.keyword_type)}</td>
+              <td>{valueLabel(snapshot.search_volume)}</td>
+              <td>{formatMoney(snapshot.ppc_bid)}</td>
+              <td>{formatPercent(snapshot.purchase_rate)}</td>
+              <td>{valueLabel(snapshot.ad_competitor_count)}</td>
+              <td>{valueLabel(snapshot.title_density)}</td>
+              <td>{keywordSnapshotVerdict(snapshot)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function keywordTypeLabel(type: KeywordSnapshot['keyword_type']): string {
+  const labels: Record<KeywordSnapshot['keyword_type'], string> = {
+    main: '主关键词',
+    long_tail: '长尾词',
+    auto_generated: '自动建议',
+    manual: '手动长尾',
+  };
+  return labels[type];
+}
+
+function keywordSnapshotVerdict(snapshot: KeywordSnapshot): string {
+  if (snapshot.error) return '查询失败';
+  const searchFit = (snapshot.search_volume ?? 0) >= 300 && (snapshot.search_volume ?? 0) <= 5000;
+  const ppcFit = typeof snapshot.ppc_bid === 'number' && snapshot.ppc_bid <= 1;
+  const competitionFit = (snapshot.ad_competitor_count ?? Number.POSITIVE_INFINITY) <= 100 && (snapshot.title_density ?? Number.POSITIVE_INFINITY) <= 50;
+  if (snapshot.keyword_type === 'main') return searchFit || (snapshot.purchase_volume ?? 0) > 0 ? '主需求可参考' : '主需求待确认';
+  return searchFit && ppcFit && competitionFit ? '推荐低预算 SP 测试' : '谨慎测试';
+}
 
 function CostInput({ label, suffix, value, onChange }: { label: string; suffix: string; value: string; onChange: (value: string) => void }) {
   return (

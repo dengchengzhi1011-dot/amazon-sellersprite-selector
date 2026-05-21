@@ -1,10 +1,14 @@
 import { useEffect, useMemo, useState } from 'react';
+import FrontReviewPanel from './components/FrontReviewPanel';
+import McpDiscoveryPage from './pages/McpDiscoveryPage';
 import McpValidationPage from './pages/McpValidationPage';
-import type { ProductRecord } from './types/mcp';
-import { loadProducts } from './utils/productStore';
+import type { FrontReview, FrontReviewStatus, KeywordSnapshot, ProductDecisionResult, ProductRecord } from './types/mcp';
+import { loadProducts, updateProductFrontReview } from './utils/productStore';
 import { resolveProductData } from './utils/scoring';
+import { longTailOpportunityLabel } from './utils/keywordTools';
 
 type AppPage =
+  | 'mcp-discovery'
   | 'excel'
   | 'products'
   | 'product-detail'
@@ -12,31 +16,53 @@ type AppPage =
   | 'review'
   | 'profit'
   | 'development'
+  | 'history'
   | 'export'
   | 'mcp-validation';
 
 const navItems: Array<{ key: AppPage; label: string }> = [
-  { key: 'excel', label: 'Excel导入' },
-  { key: 'products', label: '商品列表' },
+  { key: 'mcp-discovery', label: 'MCP找品' },
+  { key: 'products', label: '候选池' },
   { key: 'product-detail', label: '商品详情' },
-  { key: 'screening', label: '初筛池' },
+  { key: 'mcp-validation', label: 'MCP验证' },
   { key: 'review', label: '前台复核池' },
   { key: 'profit', label: '利润测算' },
   { key: 'development', label: '开发池' },
+  { key: 'history', label: '历史库' },
+  { key: 'excel', label: 'Excel导入' },
   { key: 'export', label: '导出' },
-  { key: 'mcp-validation', label: 'MCP验证' },
 ];
+
+type ValidationSeed = {
+  mainKeyword: string;
+  title: string;
+  category: string;
+  generateLongTail: boolean;
+  queryLongTail: boolean;
+};
 
 function readInitialPage(): AppPage {
   const params = new URLSearchParams(window.location.search);
   const page = params.get('page') as AppPage | null;
-  return navItems.some((item) => item.key === page) ? page! : 'mcp-validation';
+  return navItems.some((item) => item.key === page) ? page! : 'mcp-discovery';
+}
+
+function readValidationSeed(): ValidationSeed {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    mainKeyword: params.get('main_keyword') ?? '',
+    title: params.get('seed_title') ?? '',
+    category: params.get('seed_category') ?? '',
+    generateLongTail: params.get('generate_long_tail') === '1',
+    queryLongTail: params.get('query_long_tail') === '1',
+  };
 }
 
 function App() {
   const [activePage, setActivePage] = useState<AppPage>(() => readInitialPage());
   const [collapsed, setCollapsed] = useState(false);
   const [mcpAsin, setMcpAsin] = useState(() => new URLSearchParams(window.location.search).get('asin') ?? 'B0GJSCQ3PS');
+  const [mcpSeed, setMcpSeed] = useState<ValidationSeed>(() => readValidationSeed());
   const [detailAsin, setDetailAsin] = useState(() => new URLSearchParams(window.location.search).get('asin') ?? 'B0GJSCQ3PS');
   const [products, setProducts] = useState<ProductRecord[]>(() => loadProducts());
 
@@ -44,6 +70,7 @@ function App() {
     const onPopState = () => {
       setActivePage(readInitialPage());
       setMcpAsin(new URLSearchParams(window.location.search).get('asin') ?? 'B0GJSCQ3PS');
+      setMcpSeed(readValidationSeed());
       setDetailAsin(new URLSearchParams(window.location.search).get('asin') ?? 'B0GJSCQ3PS');
     };
     const reloadProducts = () => setProducts(loadProducts());
@@ -64,11 +91,21 @@ function App() {
     window.history.pushState(null, '', `?${next.toString()}`);
     setActivePage(page);
     if (params?.asin) setMcpAsin(params.asin);
+    if (page === 'mcp-validation') {
+      setMcpSeed({
+        mainKeyword: params?.main_keyword ?? '',
+        title: params?.seed_title ?? '',
+        category: params?.seed_category ?? '',
+        generateLongTail: params?.generate_long_tail === '1',
+        queryLongTail: params?.query_long_tail === '1',
+      });
+    }
     if (params?.asin) setDetailAsin(params.asin);
     setProducts(loadProducts());
   };
 
-  const title = useMemo(() => navItems.find((item) => item.key === activePage)?.label ?? 'MCP验证', [activePage]);
+  const title = useMemo(() => navItems.find((item) => item.key === activePage)?.label ?? 'MCP找品', [activePage]);
+  const saveFrontReview = (asin: string, review: FrontReview) => setProducts((current) => updateProductFrontReview(current, asin, review));
 
   return (
     <div className="app-shell">
@@ -110,12 +147,36 @@ function App() {
           <div className="header-note">单次手动验证，不做批量抓取</div>
         </header>
 
-        {activePage === 'mcp-validation' ? (
-          <McpValidationPage initialAsin={mcpAsin} />
+        {activePage === 'mcp-discovery' ? (
+          <McpDiscoveryPage
+            products={products}
+            onProductsChange={setProducts}
+            onSendToValidation={(asin, seed) => navigate('mcp-validation', {
+              asin,
+              main_keyword: seed?.mainKeyword ?? '',
+              seed_title: seed?.title ?? '',
+              seed_category: seed?.category ?? '',
+              generate_long_tail: seed?.generateLongTail ? '1' : '',
+              query_long_tail: seed?.queryLongTail ? '1' : '',
+            })}
+            onOpenReview={(asin) => navigate('product-detail', { asin })}
+            onOpenDevelopment={() => navigate('development')}
+          />
+        ) : activePage === 'mcp-validation' ? (
+          <McpValidationPage
+            initialAsin={mcpAsin}
+            initialMainKeyword={mcpSeed.mainKeyword}
+            initialTitle={mcpSeed.title}
+            initialCategory={mcpSeed.category}
+            initialGenerateLongTail={mcpSeed.generateLongTail}
+            initialQueryLongTail={mcpSeed.queryLongTail}
+          />
         ) : activePage === 'products' ? (
           <ProductListPage products={products} navigate={navigate} reload={() => setProducts(loadProducts())} />
         ) : activePage === 'product-detail' ? (
-          <ProductDetailPage product={products.find((product) => product.asin === detailAsin) ?? products[0]} navigate={navigate} />
+          <ProductDetailPage product={products.find((product) => product.asin === detailAsin) ?? products[0]} navigate={navigate} onSaveReview={saveFrontReview} />
+        ) : activePage === 'review' ? (
+          <FrontReviewPoolPage products={products} navigate={navigate} onSaveReview={saveFrontReview} />
         ) : (
           <PlaceholderPage page={title} />
         )}
@@ -128,8 +189,8 @@ function ProductListPage({ products, navigate, reload }: { products: ProductReco
   return (
     <section className="content-section">
       <div className="section-heading">
-        <h2>商品列表</h2>
-        <p>Excel 原始数据与 MCP 复核数据分开保存，列表评分优先使用 MCP 最新数据。</p>
+        <h2>候选池</h2>
+        <p>MCP 类目找品、Excel 原始数据与 MCP 复核数据分开保存，列表评分优先使用 MCP 最新数据。</p>
       </div>
       <div className="action-row compact-actions">
         <button className="secondary-button" type="button" onClick={reload}>
@@ -150,6 +211,9 @@ function ProductListPage({ products, navigate, reload }: { products: ProductReco
               <th>低竞价广告机会</th>
               <th>最终铺货分</th>
               <th>分层</th>
+              <th>前台复核状态</th>
+              <th>前台复核分</th>
+              <th>最终建议</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -179,6 +243,9 @@ function ProductRow({ product, navigate }: { product: ProductRecord; navigate: (
       <td>{score.low_bid_ad_score.signal}</td>
       <td><strong>{score.flea_market_score}</strong></td>
       <td>{score.layer}</td>
+      <td>{frontReviewStatusLabel(product.front_review.status)}</td>
+      <td>{product.front_review.front_review_score}</td>
+      <td>{decisionLabel(product.decision.final_decision)}</td>
       <td className="table-actions">
         <button className="secondary-button" type="button" onClick={() => navigate('mcp-validation', { asin: product.asin })}>
           发送到 MCP 验证
@@ -206,7 +273,16 @@ function StatusBadge({ product }: { product: ProductRecord }) {
   return <span className={`mcp-status mcp-status-${product.mcp_status}`}>{label}</span>;
 }
 
-function ProductDetailPage({ product, navigate }: { product: ProductRecord | undefined; navigate: (page: AppPage, params?: Record<string, string>) => void }) {
+function ProductDetailPage({
+  product,
+  navigate,
+  onSaveReview,
+}: {
+  product: ProductRecord | undefined;
+  navigate: (page: AppPage, params?: Record<string, string>) => void;
+  onSaveReview: (asin: string, review: FrontReview) => void;
+}) {
+  const [tab, setTab] = useState<'overview' | 'front-review'>('overview');
   if (!product) return <PlaceholderPage page="商品详情" />;
   const resolved = resolveProductData(product);
   const diffRows = buildDiffRows(product);
@@ -224,45 +300,249 @@ function ProductDetailPage({ product, navigate }: { product: ProductRecord | und
             发送到 MCP 验证
           </button>
         </div>
+        <div className="detail-tabs">
+          <button className={tab === 'overview' ? 'detail-tab detail-tab-active' : 'detail-tab'} type="button" onClick={() => setTab('overview')}>
+            数据与决策
+          </button>
+          <button className={tab === 'front-review' ? 'detail-tab detail-tab-active' : 'detail-tab'} type="button" onClick={() => setTab('front-review')}>
+            前台复核
+          </button>
+        </div>
+      </section>
+
+      {tab === 'front-review' ? (
+        <FrontReviewPanel product={product} onSave={(review) => onSaveReview(product.asin, review)} />
+      ) : (
+        <>
+          <DecisionCard decision={product.decision} />
+          <KeywordAdOpportunityCard product={product} />
         <div className="score-grid">
           <Metric label="低评论出单分" value={`${product.score.low_review_sales_score.score}/30`} />
           <Metric label="价格毛利分" value={`${product.score.price_margin_score.score}/25`} />
           <Metric label="全成本毛利分" value={`${product.score.final_margin_score.score}/20`} />
           <Metric label="广告机会分" value={`${product.score.low_bid_ad_score.score}/15`} />
           <Metric label="安全分" value={`${product.score.listing_safety_score.score}/10`} />
+          <Metric label="评分风险" value={product.score.rating_risk_note} />
         </div>
-      </section>
 
-      <section className="compare-grid">
-        <DataCard title="Excel 数据" rows={excelRows(product)} />
-        <DataCard title="MCP 数据" rows={mcpRows(product)} />
-        <div className="content-section">
-          <div className="section-heading">
-            <h2>数据差异</h2>
-            <p>{hasLargeDiff ? 'Excel 数据与 MCP 最新数据存在差异，建议以前台/MCP复核为准。' : '暂无明显差异，缺失字段仍需复核。'}</p>
-          </div>
-          <div className="diff-list">
-            {diffRows.map((row) => (
-              <div className={`diff-row ${row.large ? 'diff-large' : ''}`} key={row.label}>
-                <span>{row.label}</span>
-                <strong>{row.message}</strong>
+          <section className="compare-grid">
+            <DataCard title="Excel 数据" rows={excelRows(product)} />
+            <DataCard title="MCP 数据" rows={mcpRows(product)} />
+            <div className="content-section">
+              <div className="section-heading">
+                <h2>数据差异</h2>
+                <p>{hasLargeDiff ? 'Excel 数据与 MCP 最新数据存在差异，建议以前台/MCP复核为准。' : '暂无明显差异，缺失字段仍需复核。'}</p>
               </div>
-            ))}
-          </div>
-        </div>
-      </section>
+              <div className="diff-list">
+                {diffRows.map((row) => (
+                  <div className={`diff-row ${row.large ? 'diff-large' : ''}`} key={row.label}>
+                    <span>{row.label}</span>
+                    <strong>{row.message}</strong>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
 
+          <section className="content-section">
+            <div className="section-heading">
+              <h2>评分备注</h2>
+            </div>
+            <div className="warning-list">
+              {[...resolved.missing_notes, ...product.score.layer_reasons, ...product.score.price_margin_score.notes, ...product.score.final_margin_score.notes, ...product.score.low_bid_ad_score.notes, ...product.score.listing_safety_score.notes].map((note) => (
+                <p key={note}>{note}</p>
+              ))}
+            </div>
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
+
+function KeywordAdOpportunityCard({ product }: { product: ProductRecord }) {
+  const snapshot = product.mcp_snapshot;
+  const keywordSnapshots = snapshot?.keyword_snapshots ?? [];
+  const mainSnapshot = keywordSnapshots.find((keyword) => keyword.keyword_type === 'main') ?? null;
+  const longTailSnapshots = keywordSnapshots.filter((keyword) => keyword.keyword_type !== 'main');
+  return (
+    <section className="content-section keyword-opportunity-card">
+      <div className="section-heading">
+        <h2>关键词广告机会</h2>
+        <p>长尾机会：{longTailOpportunityLabel(snapshot?.long_tail_opportunity_level ?? 'unknown')}，广告机会分 {product.score.low_bid_ad_score.score}/15。</p>
+      </div>
+      <div className="keyword-opportunity-summary">
+        <Metric label="主关键词" value={snapshot?.main_keyword || mainSnapshot?.keyword || '待补充'} />
+        <Metric label="长尾词数量" value={String((snapshot?.long_tail_keywords ?? []).length)} />
+        <Metric label="推荐 SP 词" value={String((snapshot?.recommended_sp_keywords ?? []).length)} />
+        <Metric label="评分解释" value={product.score.low_bid_ad_score.signal} />
+      </div>
+      <KeywordOpportunityTable snapshots={keywordSnapshots} />
+      <div className="compare-grid keyword-recommend-grid">
+        <KeywordList title="推荐低预算 SP 测试词" keywords={snapshot?.recommended_sp_keywords ?? []} empty="待查询长尾词后确认。" />
+        <KeywordList title="不建议测试词" keywords={snapshot?.rejected_keywords ?? []} empty="暂未沉淀不建议词。" />
+      </div>
+      {!longTailSnapshots.length && <p className="helper-copy">尚未查询长尾词数据，当前广告分为中性分并标记待确认。</p>}
+    </section>
+  );
+}
+
+function KeywordOpportunityTable({ snapshots }: { snapshots: KeywordSnapshot[] }) {
+  if (!snapshots.length) return <div className="empty-state">当前商品还没有关键词快照。</div>;
+  return (
+    <div className="table-wrap keyword-table">
+      <table>
+        <thead>
+          <tr>
+            <th>关键词</th>
+            <th>类型</th>
+            <th>搜索量</th>
+            <th>PPC</th>
+            <th>购买率</th>
+            <th>广告竞品数</th>
+            <th>标题密度</th>
+            <th>判断</th>
+          </tr>
+        </thead>
+        <tbody>
+          {snapshots.map((snapshot) => (
+            <tr key={`${snapshot.keyword_type}-${snapshot.keyword}`}>
+              <td>{snapshot.keyword || '未返回'}</td>
+              <td>{keywordTypeLabel(snapshot.keyword_type)}</td>
+              <td>{valueLabel(snapshot.search_volume)}</td>
+              <td>{formatMoney(snapshot.ppc_bid)}</td>
+              <td>{formatPercent(snapshot.purchase_rate)}</td>
+              <td>{valueLabel(snapshot.ad_competitor_count)}</td>
+              <td>{valueLabel(snapshot.title_density)}</td>
+              <td>{keywordOpportunityVerdict(snapshot)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function KeywordList({ title, keywords, empty }: { title: string; keywords: string[]; empty: string }) {
+  return (
+    <div className="keyword-list-panel">
+      <div className="section-heading">
+        <h2>{title}</h2>
+      </div>
+      <p>{keywords.join('、') || empty}</p>
+    </div>
+  );
+}
+
+function keywordTypeLabel(type: KeywordSnapshot['keyword_type']): string {
+  const labels: Record<KeywordSnapshot['keyword_type'], string> = {
+    main: '主词',
+    long_tail: '长尾',
+    auto_generated: '自动建议',
+    manual: '手动长尾',
+  };
+  return labels[type];
+}
+
+function keywordOpportunityVerdict(snapshot: KeywordSnapshot): string {
+  if (snapshot.error) return '查询失败';
+  const searchReady = (snapshot.search_volume ?? 0) >= 300 && (snapshot.search_volume ?? 0) <= 5000;
+  const bidReady = (snapshot.ppc_bid ?? Number.POSITIVE_INFINITY) <= 1;
+  const competitionReady = (snapshot.ad_competitor_count ?? Number.POSITIVE_INFINITY) <= 100 && (snapshot.title_density ?? Number.POSITIVE_INFINITY) <= 50;
+  if (snapshot.keyword_type === 'main') return '主需求参考';
+  return searchReady && bidReady && competitionReady ? '推荐测试' : '谨慎测试';
+}
+
+function FrontReviewPoolPage({
+  products,
+  navigate,
+  onSaveReview,
+}: {
+  products: ProductRecord[];
+  navigate: (page: AppPage, params?: Record<string, string>) => void;
+  onSaveReview: (asin: string, review: FrontReview) => void;
+}) {
+  const [selectedAsin, setSelectedAsin] = useState(products[0]?.asin ?? '');
+  const selected = products.find((product) => product.asin === selectedAsin) ?? products[0];
+
+  if (!selected) return <PlaceholderPage page="前台复核池" />;
+
+  return (
+    <div className="detail-stack">
       <section className="content-section">
         <div className="section-heading">
-          <h2>评分备注</h2>
+          <h2>前台复核池</h2>
+          <p>这里继续人工确认前台页面切入点，保存后会回写商品和已有候选记录。</p>
         </div>
-        <div className="warning-list">
-          {[...resolved.missing_notes, ...product.score.layer_reasons, ...product.score.price_margin_score.notes, ...product.score.final_margin_score.notes, ...product.score.low_bid_ad_score.notes].map((note) => (
-            <p key={note}>{note}</p>
-          ))}
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ASIN</th>
+                <th>标题</th>
+                <th>MCP</th>
+                <th>前台复核</th>
+                <th>复核分</th>
+                <th>最终建议</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {products.map((product) => (
+                <tr key={product.asin}>
+                  <td>{product.asin}</td>
+                  <td>{resolveProductData(product).title || '未返回'}</td>
+                  <td><StatusBadge product={product} /></td>
+                  <td>{frontReviewStatusLabel(product.front_review.status)}</td>
+                  <td>{product.front_review.front_review_score}</td>
+                  <td>{decisionLabel(product.decision.final_decision)}</td>
+                  <td className="table-actions">
+                    <button className="secondary-button" type="button" onClick={() => setSelectedAsin(product.asin)}>
+                      前台复核
+                    </button>
+                    <button className="secondary-button" type="button" onClick={() => navigate('product-detail', { asin: product.asin })}>
+                      商品详情
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </section>
+      <FrontReviewPanel product={selected} onSave={(review) => onSaveReview(selected.asin, review)} />
     </div>
+  );
+}
+
+function DecisionCard({ decision }: { decision: ProductDecisionResult }) {
+  const stages = [
+    ['Excel 初筛', decision.excel_screening],
+    ['MCP 复核', decision.mcp_review],
+    ['前台复核', decision.front_review],
+    ['利润测算', decision.profit_check],
+  ] as const;
+  return (
+    <section className="content-section decision-card">
+      <div className="section-heading">
+        <h2>最终决策</h2>
+        <p>最终建议：<strong>{decisionLabel(decision.final_decision)}</strong></p>
+      </div>
+      <div className="decision-grid">
+        {stages.map(([title, stage]) => (
+          <div className={`decision-stage decision-stage-${stage.status}`} key={title}>
+            <span>{title}</span>
+            <strong>{stage.label}</strong>
+            <small>{stage.reasons[0] ?? '暂无备注'}</small>
+          </div>
+        ))}
+      </div>
+      <div className="decision-reasons">
+        {decision.reasons.map((reason) => (
+          <p key={reason}>{reason}</p>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -345,6 +625,27 @@ function formatMoney(value: number | null | undefined): string {
 function formatPercent(value: number | null | undefined): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '待补充';
   return `${(value * 100).toFixed(1)}%`;
+}
+
+function frontReviewStatusLabel(status: FrontReviewStatus): string {
+  const labels: Record<FrontReviewStatus, string> = {
+    not_started: '未开始',
+    in_progress: '复核中',
+    passed: '通过',
+    failed: '不通过',
+    need_second_check: '待二次确认',
+  };
+  return labels[status];
+}
+
+function decisionLabel(decision: ProductDecisionResult['final_decision']): string {
+  const labels: Record<ProductDecisionResult['final_decision'], string> = {
+    develop: '开发',
+    small_test: '小批量测试',
+    wait: '等待',
+    reject: '放弃',
+  };
+  return labels[decision];
 }
 
 function Metric({ label, value }: { label: string; value: string }) {
