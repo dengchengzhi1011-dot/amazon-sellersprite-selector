@@ -536,6 +536,94 @@ th {
   font-size: 12px;
 }
 
+.table-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 210px;
+}
+
+.mcp-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  border-radius: 999px;
+  background: #edf1f4;
+  color: #46515d;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.mcp-status-checked {
+  background: #ddf5e6;
+  color: #19633a;
+}
+
+.mcp-status-failed {
+  background: #fff0f0;
+  color: #922f2f;
+}
+
+.mcp-status-checking {
+  background: #fff6e7;
+  color: #7b5609;
+}
+
+.score-grid,
+.compare-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.score-grid {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.compare-grid {
+  grid-template-columns: repeat(3, minmax(240px, 1fr));
+  align-items: start;
+}
+
+.detail-stack {
+  display: grid;
+  gap: 16px;
+}
+
+.diff-list {
+  display: grid;
+  gap: 8px;
+}
+
+.diff-row {
+  display: grid;
+  gap: 5px;
+  border: 1px solid #e1e6eb;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 10px;
+}
+
+.diff-row span {
+  color: #687380;
+  font-size: 12px;
+}
+
+.diff-row strong {
+  color: #26313c;
+}
+
+.diff-large {
+  border-color: #f0d8a7;
+  background: #fff8e8;
+}
+
+.compact-actions {
+  margin-top: 0;
+  margin-bottom: 14px;
+}
+
 .empty-state {
   border: 1px dashed #cfd7df;
   border-radius: 8px;
@@ -599,6 +687,7 @@ pre {
   .diagnosis-grid,
   .cost-layout,
   .cost-input-grid,
+  .compare-grid,
   .status-grid {
     grid-template-columns: 1fr;
   }

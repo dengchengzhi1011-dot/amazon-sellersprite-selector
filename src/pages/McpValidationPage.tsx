@@ -17,6 +17,15 @@ import {
   fetchTrafficKeywordStat,
   getMcpFriendlyError,
 } from '../utils/sellerspriteMcp';
+import { createMcpSnapshotFromValidation } from '../utils/scoring';
+import {
+  createCandidateRecord,
+  exportCandidatesCsv,
+  loadCandidates,
+  loadProducts,
+  saveCandidates,
+  upsertProductMcpData,
+} from '../utils/productStore';
 
 type FieldStatus = '可用' | '未返回' | '需要人工补充' | '需要前台复核';
 type FieldItem = {
@@ -28,10 +37,19 @@ type FieldItem = {
 };
 
 type SectionKey = 'asin_detail' | 'asin_prediction' | 'traffic_keyword_stat' | 'keyword_miner';
-type CostInputKey = keyof McpManualCostInput;
+type CostInputKey =
+  | 'target_discount_rate'
+  | 'referral_fee_rate'
+  | 'manual_fba_fee'
+  | 'purchase_cost'
+  | 'first_leg_shipping'
+  | 'packaging_cost'
+  | 'storage_cost_usd'
+  | 'platform_other_fee'
+  | 'return_loss'
+  | 'other_cost';
 
 const defaultKeyword = 'easter eggs fillers';
-const candidatesStorageKey = 'amazon-sellersprite-selector:mcp-candidates';
 const defaultCostInputs: Record<CostInputKey, string> = {
   target_discount_rate: '0.05',
   referral_fee_rate: '0.15',
@@ -39,6 +57,9 @@ const defaultCostInputs: Record<CostInputKey, string> = {
   purchase_cost: '',
   first_leg_shipping: '',
   packaging_cost: '',
+  storage_cost_usd: '',
+  platform_other_fee: '',
+  return_loss: '',
   other_cost: '',
 };
 
@@ -94,7 +115,12 @@ function readCostInputs(inputs: Record<CostInputKey, string>): McpManualCostInpu
     purchase_cost: parseInputNumber(inputs.purchase_cost),
     first_leg_shipping: parseInputNumber(inputs.first_leg_shipping),
     packaging_cost: parseInputNumber(inputs.packaging_cost),
+    storage_cost_usd: parseInputNumber(inputs.storage_cost_usd),
+    platform_other_fee: parseInputNumber(inputs.platform_other_fee),
+    return_loss: parseInputNumber(inputs.return_loss),
     other_cost: parseInputNumber(inputs.other_cost),
+    risk_level: 'none',
+    risk_tags: [],
   };
 }
 
@@ -199,6 +225,7 @@ function calculateMarginSnapshot(product: McpProductSnapshot | null, costs: McpM
   if (costs.purchase_cost === null) warnings.push('采购价未录入，最终毛利率会偏高。');
   if (costs.first_leg_shipping === null) warnings.push('头程费用未录入，最终毛利率会偏高。');
   if (costs.packaging_cost === null) warnings.push('包装费用未录入，最终毛利率会偏高。');
+  if (costs.return_loss === null) warnings.push('退货损耗未录入，最终毛利率会偏高。');
 
   const targetPrice = typeof basePrice === 'number' ? basePrice * (1 - targetDiscountRate) : null;
   const referralFee = typeof targetPrice === 'number' ? targetPrice * referralFeeRate : null;
@@ -206,11 +233,14 @@ function calculateMarginSnapshot(product: McpProductSnapshot | null, costs: McpM
     costValue(costs.purchase_cost) +
     costValue(costs.first_leg_shipping) +
     costValue(costs.packaging_cost) +
+    costValue(costs.storage_cost_usd ?? null) +
+    costValue(costs.platform_other_fee ?? null) +
+    costValue(costs.return_loss ?? null) +
     costValue(costs.other_cost);
 
   const platformMarginRate =
     typeof targetPrice === 'number' && typeof referralFee === 'number' && typeof fbaFee === 'number' && targetPrice > 0
-      ? (targetPrice - referralFee - fbaFee) / targetPrice
+      ? (targetPrice - referralFee - fbaFee - costValue(costs.platform_other_fee ?? null)) / targetPrice
       : null;
 
   const finalMarginRate =
@@ -286,21 +316,6 @@ function statusText(status: McpCallStatus): string {
 
 function confirmMcpCall(): boolean {
   return window.confirm('本次将调用卖家精灵 MCP，可能消耗额度。是否继续？');
-}
-
-function loadCandidates(): McpCandidateRecord[] {
-  try {
-    const raw = window.localStorage.getItem(candidatesStorageKey);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveCandidates(candidates: McpCandidateRecord[]) {
-  window.localStorage.setItem(candidatesStorageKey, JSON.stringify(candidates));
 }
 
 export default function McpValidationPage({ initialAsin }: { initialAsin?: string }) {
@@ -386,29 +401,77 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
     setCostInputs((current) => ({ ...current, [key]: value }));
   };
 
+  const buildMcpSnapshot = () => {
+    const hasSuccessData = result.asin_detail?.data || result.asin_prediction?.data || result.keyword_miner?.data || result.traffic_keyword_stat?.data;
+    if (!hasSuccessData) return null;
+    return createMcpSnapshotFromValidation({
+      product: mergedProduct,
+      keyword: keywordData,
+      prediction: result.asin_prediction?.data ?? null,
+      traffic: result.traffic_keyword_stat?.data ?? result.traffic_keyword_stat?.raw ?? null,
+      asin: asin.trim(),
+      raw: {
+        asin_detail: result.asin_detail?.raw ?? null,
+        asin_prediction: result.asin_prediction?.raw ?? null,
+        traffic_keyword_stat: result.traffic_keyword_stat?.raw ?? null,
+        keyword_miner: result.keyword_miner?.raw ?? null,
+      },
+    });
+  };
+
+  const saveBackToProduct = (markCandidate = false) => {
+    const products = loadProducts();
+    const nextProducts = upsertProductMcpData({
+      products,
+      asin,
+      mcpSnapshot: buildMcpSnapshot(),
+      validation: result,
+      manualCosts,
+      notes,
+      markCandidate,
+    });
+    const savedProduct = nextProducts.find((product) => product.asin === asin.trim()) ?? null;
+    setSaveNotice(markCandidate ? '已保存为候选商品，并已回填商品 MCP 数据。' : '已保存到当前商品，并已重新计算铺货评分。');
+    return savedProduct;
+  };
+
+  const updateProductMcpData = () => {
+    saveBackToProduct(false);
+    setSaveNotice('已更新商品 MCP 数据，并重新计算铺货评分。');
+  };
+
   const saveCandidate = () => {
-    const record: McpCandidateRecord = {
-      id: `${Date.now()}-${asin.trim() || 'unknown'}`,
+    const savedProduct = saveBackToProduct(true);
+    const record = createCandidateRecord({
       asin: asin.trim(),
       keyword: keyword.trim(),
-      saved_at: new Date().toISOString(),
-      product: mergedProduct,
-      keyword_snapshot: keywordData,
+      product: savedProduct,
       validation: result,
       costs: manualCosts,
       margin: marginSnapshot,
       notes,
-    };
+    });
     const nextCandidates = [record, ...candidates].slice(0, 50);
     setCandidates(nextCandidates);
     saveCandidates(nextCandidates);
-    setSaveNotice('已保存到本地候选记录。');
+    setSaveNotice('已保存为候选商品和本地候选记录。');
   };
 
   const deleteCandidate = (id: string) => {
     const nextCandidates = candidates.filter((candidate) => candidate.id !== id);
     setCandidates(nextCandidates);
     saveCandidates(nextCandidates);
+  };
+
+  const exportCandidateRecords = () => {
+    const csv = exportCandidatesCsv(candidates);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `mcp-candidates-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -443,6 +506,17 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
           </button>
           <button className="primary-button" type="button" onClick={runAll} disabled={isLoading}>
             一键小样本验证
+          </button>
+        </div>
+        <div className="action-row">
+          <button type="button" onClick={() => saveBackToProduct(false)}>
+            保存到当前商品
+          </button>
+          <button type="button" onClick={saveCandidate}>
+            保存为候选商品
+          </button>
+          <button type="button" onClick={updateProductMcpData}>
+            更新商品 MCP 数据
           </button>
         </div>
         <div className="status-grid">
@@ -542,6 +616,9 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
             <CostInput label="采购价" suffix="单件成本" value={costInputs.purchase_cost} onChange={(value) => updateCostInput('purchase_cost', value)} />
             <CostInput label="头程费用" suffix="单件分摊" value={costInputs.first_leg_shipping} onChange={(value) => updateCostInput('first_leg_shipping', value)} />
             <CostInput label="包装费用" suffix="单件分摊" value={costInputs.packaging_cost} onChange={(value) => updateCostInput('packaging_cost', value)} />
+            <CostInput label="仓储费用" suffix="单件分摊" value={costInputs.storage_cost_usd} onChange={(value) => updateCostInput('storage_cost_usd', value)} />
+            <CostInput label="平台其他费用" suffix="广告外平台费" value={costInputs.platform_other_fee} onChange={(value) => updateCostInput('platform_other_fee', value)} />
+            <CostInput label="退货损耗" suffix="单件估算" value={costInputs.return_loss} onChange={(value) => updateCostInput('return_loss', value)} />
             <CostInput label="其他成本" suffix="贴标/损耗等" value={costInputs.other_cost} onChange={(value) => updateCostInput('other_cost', value)} />
           </div>
           <div className="margin-panel">
@@ -579,6 +656,13 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
           <h2>本地候选记录</h2>
           <p>只保存在当前浏览器本地，用于小样本验证沉淀；不会触发 MCP 调用。</p>
         </div>
+        {candidates.length > 0 && (
+          <div className="action-row compact-actions">
+            <button className="secondary-button" type="button" onClick={exportCandidateRecords}>
+              导出候选记录
+            </button>
+          </div>
+        )}
         {candidates.length ? (
           <div className="candidate-list">
             {candidates.map((candidate) => (
@@ -586,6 +670,7 @@ export default function McpValidationPage({ initialAsin }: { initialAsin?: strin
                 <div>
                   <strong>{candidate.asin || '未填写 ASIN'}</strong>
                   <span>{candidate.keyword || '未填写关键词'}</span>
+                  <span>{candidate.final_advice || '待复核'}</span>
                   <small>{new Date(candidate.saved_at).toLocaleString()}</small>
                 </div>
                 <div className="candidate-metrics">
