@@ -8,6 +8,13 @@
     "dev:ui": "vite",
     "bridge": "node scripts/sellersprite-bridge.mjs",
     "build": "tsc -b && vite build",
+    "typecheck": "tsc -b",
+    "validate:new-product-sales": "node scripts/validate-new-product-sales-signal.mjs",
+    "validate:mcp-flow": "node scripts/validate-mcp-validation-flow.mjs",
+    "validate:discovery-layout": "node scripts/validate-discovery-layout.mjs",
+    "validate:navigation": "node scripts/validate-navigation.mjs",
+    "audit:security": "npm audit --omit=dev",
+    "audit:all": "npm run validate:mcp-flow && npm run validate:new-product-sales && npm run validate:discovery-layout && npm run validate:navigation && npm run typecheck && npm run build && npm run audit:security",
     "preview": "vite preview"
   },
   "dependencies": {

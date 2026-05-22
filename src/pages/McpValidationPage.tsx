@@ -1,7 +1,13 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import ProductThumbnail from '../components/ProductThumbnail';
 import type {
+  AsinKeywordInsight,
+  AsinKeywordClassification,
   KeywordSnapshot,
   McpCallStatus,
+  McpCallStatusDetail,
+  McpDataStatus,
+  McpRequestStatus,
   McpCandidateRecord,
   McpKeywordSnapshot,
   McpManualCostInput,
@@ -9,39 +15,47 @@ import type {
   McpPredictionSnapshot,
   McpProductSnapshot,
   McpToolCallResult,
+  McpValidationFieldAvailability,
+  McpValidationFieldStatus,
   McpValidationResult,
+  McpValidationSession,
 } from '../types/mcp';
 import {
   fetchAsinDetail,
+  fetchAsinKeywords,
   fetchAsinPrediction,
   fetchKeywordMiner,
   fetchTrafficKeywordStat,
   getMcpFriendlyError,
 } from '../utils/sellerspriteMcp';
-import { createMcpSnapshotFromValidation } from '../utils/scoring';
+import { calculateNewProductSalesSignalScore, createMcpSnapshotFromValidation, normalizeEffectiveReviewCount } from '../utils/scoring';
 import {
   createCandidateRecord,
+  buildNormalizedSnapshotFromSession,
+  deleteMcpValidationSession,
   exportCandidatesCsv,
+  getLatestMcpValidationSession,
+  getMcpValidationSessionByAsin,
+  listMcpValidationSessions,
   loadCandidates,
   loadProducts,
   saveCandidates,
+  saveMcpValidationSession,
   upsertProductMcpData,
 } from '../utils/productStore';
 import {
   calculateLongTailOpportunity,
+  classifyAsinKeywords,
+  exportKeywordInsightsCsv,
   generateLongTailKeywordCandidates,
+  insightsFromTitleCandidates,
   longTailOpportunityLabel,
   normalizeKeywordSnapshot,
 } from '../utils/keywordTools';
+import { extractImageCandidate } from '../utils/imageTools';
 
-type FieldStatus = '可用' | '未返回' | '需要人工补充' | '需要前台复核';
-type FieldItem = {
-  group: '商品侧' | '关键词侧';
-  field: string;
-  label: string;
-  value: unknown;
-  status: FieldStatus;
-};
+type FieldStatus = McpValidationFieldStatus;
+type FieldItem = McpValidationFieldAvailability;
 
 type SectionKey = 'asin_detail' | 'asin_prediction' | 'traffic_keyword_stat' | 'keyword_miner';
 type CostInputKey =
@@ -163,6 +177,8 @@ function getMergedProduct(product: McpProductSnapshot | null, prediction: McpPre
     fba_fee: product?.fba_fee ?? null,
     referral_fee: product?.referral_fee ?? null,
     referral_fee_rate: product?.referral_fee_rate ?? null,
+    main_image_url: product?.main_image_url ?? null,
+    main_image_source: product?.main_image_source ?? (product?.main_image_url ? 'mcp' : 'missing'),
     seller: product?.seller ?? null,
     seller_type: product?.seller_type ?? null,
     variation_count: product?.variation_count ?? null,
@@ -306,6 +322,30 @@ function diagnoseAdKeyword(keyword: McpKeywordSnapshot | null, keywordText: stri
   ];
 }
 
+function previewSalesConfidence(product: McpProductSnapshot | null, keywordConfidence: string): string {
+  const hasSales = typeof product?.monthly_sales === 'number';
+  const hasBsr = typeof product?.bsr === 'number';
+  const hasKeywordEvidence = keywordConfidence === 'high' || keywordConfidence === 'medium_high';
+  const hasPartialKeywordEvidence = hasKeywordEvidence || keywordConfidence === 'medium';
+
+  if (hasSales && hasBsr && hasKeywordEvidence) return '90 / 销量、BSR、ASIN关键词互相印证';
+  if (hasSales && hasBsr) return '75 / 月销量与BSR基本一致';
+  if (hasSales && hasPartialKeywordEvidence) return '70 / 月销量与关键词需求有部分印证';
+  if (hasSales) return '60 / 仅有月销量预测';
+  if (hasBsr) return '40 / 仅有BSR线索';
+  return '20 / 销量数据待复核';
+}
+
+function previewVariationRisk(product: McpProductSnapshot | null): string {
+  const count = product?.variation_count;
+  if (typeof count !== 'number') return '未返回 / 变体待复核';
+  if (count >= 20) return '高 / 复杂变体，需确认父子体共享动销';
+  if (count > 15) return '中高 / 变体偏多';
+  if (count > 5) return '中 / 存在多变体';
+  if (count > 0) return '低 / 少量变体';
+  return '低 / 暂未发现变体';
+}
+
 function resultErrors(result: McpValidationResult): string[] {
   return [
     result.asin_detail?.error,
@@ -314,6 +354,98 @@ function resultErrors(result: McpValidationResult): string[] {
     result.keyword_miner?.error,
     ...result.errors,
   ].filter((item): item is string => Boolean(item));
+}
+
+function requestStatusFrom(status: McpCallStatus): McpRequestStatus {
+  if (status === 'idle') return 'idle';
+  if (status === 'loading') return 'running';
+  if (status === 'success') return 'success';
+  return 'failed';
+}
+
+function recordItems(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'object') return [];
+  const record = value as Record<string, unknown>;
+  const candidates = [record.items, record.list, record.rows, record.keywords, record.data, record.result];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate;
+    if (candidate && typeof candidate === 'object') {
+      const nested = recordItems(candidate);
+      if (nested.length) return nested;
+    }
+  }
+  return [];
+}
+
+function firstNumberFromRecord(value: unknown, keys: string[]): number | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const raw = record[key];
+    if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+    if (typeof raw === 'string') {
+      const parsed = Number(raw.replace(/[,%\s]/g, ''));
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+}
+
+function dataStatusForTool(tool: string, result: McpToolCallResult<unknown> | null, fallbackCount = 0): { dataStatus: McpDataStatus; itemsCount?: number; warning?: string; total?: number } {
+  if (!result) return { dataStatus: 'not_requested' };
+  if (result.status !== 'success') return { dataStatus: 'unknown' };
+  const itemsCount = fallbackCount || recordItems(result.data).length || recordItems(result.raw).length;
+  const total = firstNumberFromRecord(result.data, ['total', 'totalCount', 'count']) ?? firstNumberFromRecord(result.raw, ['total', 'totalCount', 'count']);
+  if (tool === 'asin_detail') {
+    const product = result.data as McpProductSnapshot | null;
+    const useful = [product?.title, product?.price, product?.review_count, product?.rating, product?.bsr].filter((item) => item !== null && item !== undefined).length;
+    if (useful >= 3) return { dataStatus: 'has_data', itemsCount: 1, total };
+    if (useful > 0) return { dataStatus: 'partial', itemsCount: 1, total, warning: '成功但商品字段不完整' };
+    return { dataStatus: 'empty', itemsCount: 0, total, warning: '成功但无商品数据' };
+  }
+  if (tool === 'asin_prediction') {
+    const prediction = result.data as McpPredictionSnapshot | null;
+    if (prediction?.recent_30d_sales !== null && prediction?.recent_30d_sales !== undefined) return { dataStatus: 'has_data', itemsCount: 1, total };
+    if ((prediction?.sales_trend?.length ?? 0) > 0 || (prediction?.bsr_trend?.length ?? 0) > 0) return { dataStatus: 'partial', itemsCount: prediction?.sales_trend.length, total, warning: '成功但只有趋势/BSR线索' };
+    return { dataStatus: 'empty', itemsCount: 0, total, warning: '成功但无销量趋势数据' };
+  }
+  if (tool === 'asin_keywords') {
+    if (itemsCount > 0) return { dataStatus: 'has_data', itemsCount, total };
+    return { dataStatus: 'empty', itemsCount: 0, total, warning: '成功但未返回真实关键词' };
+  }
+  if (tool === 'keyword_miner') {
+    if (itemsCount > 0) return { dataStatus: 'has_data', itemsCount, total };
+    const keyword = (result.data as McpKeywordSnapshot | null)?.keyword;
+    return keyword ? { dataStatus: 'partial', itemsCount: 1, total } : { dataStatus: 'empty', itemsCount: 0, total, warning: '成功但关键词指标为空' };
+  }
+  return itemsCount > 0 ? { dataStatus: 'has_data', itemsCount, total } : { dataStatus: 'empty', itemsCount: 0, total };
+}
+
+function buildCallStatusDetail(
+  tool: string,
+  label: string,
+  result: McpToolCallResult<unknown> | null,
+  fallbackStatus: McpCallStatus,
+  fallbackCount = 0,
+): McpCallStatusDetail {
+  const dataStatus = dataStatusForTool(tool, result, fallbackCount);
+  return {
+    tool,
+    label,
+    request_status: result ? requestStatusFrom(result.status) : requestStatusFrom(fallbackStatus),
+    data_status: dataStatus.dataStatus,
+    total: dataStatus.total,
+    items_count: dataStatus.itemsCount,
+    error_message: result?.error ?? undefined,
+    warning_message: dataStatus.warning,
+    last_run_at: result?.checked_at,
+    response_summary: {
+      status: result?.status ?? fallbackStatus,
+      keyword_source: tool === 'asin_keywords' && result?.raw && typeof result.raw === 'object' ? (result.raw as Record<string, unknown>).keyword_source : undefined,
+      keyword_confidence: tool === 'asin_keywords' && result?.raw && typeof result.raw === 'object' ? (result.raw as Record<string, unknown>).keyword_confidence : undefined,
+    },
+  };
 }
 
 function statusText(status: McpCallStatus): string {
@@ -325,6 +457,93 @@ function statusText(status: McpCallStatus): string {
     timeout: '超时',
   };
   return map[status];
+}
+
+function keywordSourceLabel(classification: AsinKeywordClassification): string {
+  const sources = new Set(classification.keyword_insights.map((insight) => insight.source_tool));
+  if (sources.has('traffic_keyword')) return 'traffic_keyword';
+  if (sources.has('keyword_order')) return 'keyword_order';
+  if (sources.has('keyword_miner') || sources.has('keyword_research')) return 'keyword_metrics';
+  if (sources.has('title_split_fallback') || sources.has('title_generated')) return 'title_split_fallback';
+  return 'unknown';
+}
+
+function demandConfirmed(classification: AsinKeywordClassification): boolean | 'partial' {
+  const source = keywordSourceLabel(classification);
+  if (source === 'traffic_keyword' || source === 'keyword_order') return true;
+  if (source === 'keyword_metrics') return 'partial';
+  return false;
+}
+
+function demandSource(classification: AsinKeywordClassification): string | null {
+  const source = keywordSourceLabel(classification);
+  return source === 'unknown' ? null : source;
+}
+
+function sessionStatusFromSnapshots(keywords: string[], snapshots: KeywordSnapshot[], loading: boolean): McpCallStatus {
+  if (loading) return 'loading';
+  if (!keywords.length) return 'idle';
+  const related = snapshots.filter((snapshot) => keywords.includes(snapshot.keyword ?? ''));
+  if (!related.length) return 'idle';
+  if (related.every((snapshot) => snapshot.error)) return 'failed';
+  return 'success';
+}
+
+function latestCheckedAt(...values: Array<string | null | undefined>): string | null {
+  const dates = values
+    .filter((value): value is string => Boolean(value))
+    .map((value) => new Date(value).getTime())
+    .filter((value) => Number.isFinite(value));
+  if (!dates.length) return null;
+  return new Date(Math.max(...dates)).toISOString();
+}
+
+function validationResultFromSession(session: McpValidationSession): McpValidationResult {
+  const mainSnapshot = session.main_keyword_result
+    ? [
+        normalizeKeywordSnapshot(
+          session.main_keyword,
+          'main',
+          session.main_keyword_result.status === 'success' ? session.main_keyword_result.data : null,
+          session.main_keyword_result.error,
+          session.main_keyword_result.checked_at,
+        ),
+      ]
+    : [];
+  const keywordSnapshots = [...mainSnapshot, ...session.long_tail_keyword_results];
+  return {
+    asin: session.asin,
+    keyword: session.main_keyword,
+    main_keyword: session.main_keyword,
+    long_tail_keywords: session.long_tail_keywords,
+    keyword_snapshots: keywordSnapshots,
+    status:
+      session.asin_detail_status === 'success' ||
+      session.asin_prediction_status === 'success' ||
+      session.traffic_keyword_stat_status === 'success' ||
+      session.keyword_miner_status === 'success' ||
+      session.long_tail_keywords_status === 'success'
+        ? 'success'
+        : session.asin_detail_status === 'failed' ||
+            session.asin_prediction_status === 'failed' ||
+            session.traffic_keyword_stat_status === 'failed' ||
+            session.keyword_miner_status === 'failed' ||
+            session.long_tail_keywords_status === 'failed'
+          ? 'failed'
+          : 'idle',
+    checked_at: session.last_checked_at ?? session.updated_at,
+    asin_detail: session.asin_detail_result,
+    asin_prediction: session.asin_prediction_result,
+    traffic_keyword_stat: session.traffic_keyword_stat_result,
+    keyword_miner: session.main_keyword_result,
+    errors: [
+      session.asin_detail_error,
+      session.asin_prediction_error,
+      session.traffic_keyword_stat_error,
+      session.keyword_miner_error,
+      ...session.long_tail_keyword_errors,
+    ].filter((error): error is string => Boolean(error)),
+  };
 }
 
 function confirmMcpCall(): boolean {
@@ -372,6 +591,9 @@ export default function McpValidationPage({
   const [mainKeyword, setMainKeyword] = useState(defaultKeyword);
   const [longTailText, setLongTailText] = useState('');
   const [keywordSnapshots, setKeywordSnapshots] = useState<KeywordSnapshot[]>([]);
+  const [keywordInsights, setKeywordInsights] = useState<AsinKeywordInsight[]>([]);
+  const [asinKeywordStatus, setAsinKeywordStatus] = useState<McpCallStatus>('idle');
+  const [asinKeywordRaw, setAsinKeywordRaw] = useState<unknown>(null);
   const [longTailSuggestions, setLongTailSuggestions] = useState<string[]>([]);
   const [selectedSuggestions, setSelectedSuggestions] = useState<string[]>([]);
   const [longTailLoading, setLongTailLoading] = useState(false);
@@ -383,32 +605,58 @@ export default function McpValidationPage({
   const [notes, setNotes] = useState('');
   const [candidates, setCandidates] = useState<McpCandidateRecord[]>(() => loadCandidates());
   const [saveNotice, setSaveNotice] = useState('');
+  const [sessions, setSessions] = useState<McpValidationSession[]>(() => listMcpValidationSessions());
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [restoreNotice, setRestoreNotice] = useState('');
+  const promptAsinRef = useRef('');
+  const persistReadyRef = useRef(false);
 
   useEffect(() => {
-    if (initialAsin) {
-      const seededMainKeyword = initialMainKeyword?.trim() ?? '';
-      const generated = initialGenerateLongTail
-        ? generateLongTailKeywordCandidates({
-            title: initialTitle,
-            category: initialCategory,
-            main_keyword: seededMainKeyword,
-          })
-        : [];
-      const generatedLongTails = generated.filter((keyword) => keyword !== seededMainKeyword);
-      setAsin(initialAsin);
-      setMainKeyword(seededMainKeyword);
-      setLongTailText(generatedLongTails.join('\n'));
-      setKeywordSnapshots([]);
-      setLongTailSuggestions(generated);
-      setSelectedSuggestions(generatedLongTails);
-      setPendingLongTailQuery(initialQueryLongTail && generated.length > 0);
-      setResult((current) => ({ ...current, asin: initialAsin, keyword: seededMainKeyword, main_keyword: seededMainKeyword, long_tail_keywords: generatedLongTails, keyword_snapshots: [] }));
+    const params = new URLSearchParams(window.location.search);
+    const routeAsin = params.get('asin')?.trim() ?? '';
+    const session = routeAsin ? getMcpValidationSessionByAsin(routeAsin) : getLatestMcpValidationSession();
+    if (session) {
+      applySession(session, routeAsin ? `已恢复 ASIN ${session.asin} 的最近 MCP 验证记录。` : `已恢复最近一次 MCP 验证：ASIN ${session.asin}。`);
+      return;
     }
+    const seededAsin = routeAsin || initialAsin || 'B0GJSCQ3PS';
+    const seededMainKeyword = initialMainKeyword?.trim() ?? '';
+    const generated = initialGenerateLongTail
+      ? generateLongTailKeywordCandidates({
+          title: initialTitle,
+          category: initialCategory,
+          main_keyword: seededMainKeyword,
+        })
+      : [];
+    const generatedLongTails = generated.filter((keyword) => keyword !== seededMainKeyword);
+    setCurrentSessionId(null);
+    setAsin(seededAsin);
+    setMainKeyword(seededMainKeyword);
+    setLongTailText(generatedLongTails.join('\n'));
+    setKeywordSnapshots([]);
+    setKeywordInsights([]);
+    setAsinKeywordStatus('idle');
+    setAsinKeywordRaw(null);
+    setLongTailSuggestions(generated);
+    setSelectedSuggestions(generatedLongTails);
+    setPendingLongTailQuery(initialQueryLongTail && generated.length > 0);
+    setSectionStatus(createInitialSectionStatus());
+    setResult({ ...emptyResult, asin: seededAsin, keyword: seededMainKeyword, main_keyword: seededMainKeyword, long_tail_keywords: generatedLongTails, keyword_snapshots: [] });
+    setRestoreNotice('');
   }, [initialAsin, initialCategory, initialGenerateLongTail, initialMainKeyword, initialQueryLongTail, initialTitle]);
 
   const mergedProduct = useMemo(
     () => getMergedProduct(result.asin_detail?.data ?? null, result.asin_prediction?.data ?? null),
     [result.asin_detail, result.asin_prediction],
+  );
+  const mainImageCandidate = useMemo(
+    () =>
+      extractImageCandidate({
+        normalized_snapshot: mergedProduct,
+        asin_detail: result.asin_detail?.raw ?? result.asin_detail?.data,
+        asin_prediction: result.asin_prediction?.raw ?? result.asin_prediction?.data,
+      }),
+    [mergedProduct, result.asin_detail, result.asin_prediction],
   );
   const longTailKeywords = useMemo(() => parseLongTailKeywords(longTailText), [longTailText]);
   const activeKeywordSnapshots = useMemo(
@@ -421,6 +669,18 @@ export default function McpValidationPage({
       }),
     [keywordSnapshots, longTailKeywords, mainKeyword],
   );
+  const keywordClassification: AsinKeywordClassification = useMemo(
+    () =>
+      classifyAsinKeywords({
+        asin,
+        insights: keywordInsights,
+        title: mergedProduct?.title,
+        category: mergedProduct?.category,
+        brand: mergedProduct?.brand,
+        fallbackMainKeyword: mainKeyword,
+      }),
+    [asin, keywordInsights, mainKeyword, mergedProduct?.brand, mergedProduct?.category, mergedProduct?.title],
+  );
   const keywordData =
     activeKeywordSnapshots.find((snapshot) => snapshot.keyword_type === 'main' && !snapshot.error) ??
     (result.keyword_miner?.data?.keyword?.trim().toLowerCase() === mainKeyword.trim().toLowerCase() ? result.keyword_miner.data : null);
@@ -432,6 +692,166 @@ export default function McpValidationPage({
   const marginSnapshot = useMemo(() => calculateMarginSnapshot(mergedProduct, manualCosts), [manualCosts, mergedProduct]);
   const errors = resultErrors(result);
   const isLoading = Object.values(sectionStatus).some((status) => status === 'loading');
+  const newProductSignal = useMemo(() => calculateNewProductSalesSignalScore(mergedProduct), [mergedProduct]);
+  const effectiveReviewMeta = useMemo(() => normalizeEffectiveReviewCount(mergedProduct), [mergedProduct]);
+  const salesConfidencePreview = useMemo(() => previewSalesConfidence(mergedProduct, keywordClassification.keyword_data_confidence), [keywordClassification.keyword_data_confidence, mergedProduct]);
+  const variationRiskPreview = useMemo(() => previewVariationRisk(mergedProduct), [mergedProduct]);
+  const mcpStatusDetails = useMemo<McpCallStatusDetail[]>(
+    () => [
+      buildCallStatusDetail('asin_detail', '基础信息', result.asin_detail, sectionStatus.asin_detail),
+      buildCallStatusDetail('asin_prediction', '销量趋势', result.asin_prediction, sectionStatus.asin_prediction),
+      buildCallStatusDetail('asin_keywords', '关键词证据', asinKeywordRaw ? ({ tool: 'asin_keywords', status: asinKeywordStatus, checked_at: new Date().toISOString(), data: keywordClassification.keyword_insights, raw: asinKeywordRaw, error: asinKeywordStatus === 'failed' ? keywordNotice : null } as McpToolCallResult<unknown>) : null, asinKeywordStatus, keywordClassification.keyword_insights.filter((insight) => insight.source_tool !== 'title_split_fallback' && insight.source_tool !== 'title_generated').length),
+      buildCallStatusDetail('keyword_miner', '关键词指标', result.keyword_miner, sectionStatus.keyword_miner, activeKeywordSnapshots.length),
+    ],
+    [activeKeywordSnapshots.length, asinKeywordRaw, asinKeywordStatus, keywordClassification.keyword_insights, keywordNotice, result.asin_detail, result.asin_prediction, result.keyword_miner, sectionStatus.asin_detail, sectionStatus.asin_prediction, sectionStatus.keyword_miner],
+  );
+
+  const buildMcpSnapshot = () => {
+    const hasSuccessData = result.asin_detail?.data || result.asin_prediction?.data || result.keyword_miner?.data || result.traffic_keyword_stat?.data || activeKeywordSnapshots.length;
+    if (!hasSuccessData) return null;
+    const snapshot = createMcpSnapshotFromValidation({
+      product: mergedProduct,
+      keyword: keywordData,
+      mainKeyword,
+      longTailKeywords,
+      keywordSnapshots: activeKeywordSnapshots,
+      keywordInsights: keywordClassification.keyword_insights,
+      keywordDataConfidence: keywordClassification.keyword_data_confidence,
+      prediction: result.asin_prediction?.data ?? null,
+      traffic: result.traffic_keyword_stat?.data ?? result.traffic_keyword_stat?.raw ?? null,
+      asin: asin.trim(),
+      raw: {
+        asin_detail: result.asin_detail?.raw ?? null,
+        asin_prediction: result.asin_prediction?.raw ?? null,
+        traffic_keyword_stat: result.traffic_keyword_stat?.raw ?? null,
+        keyword_miner: result.keyword_miner?.raw ?? null,
+        asin_keywords: asinKeywordRaw,
+      },
+    });
+    return {
+      ...snapshot,
+      keyword_source: keywordSourceLabel(keywordClassification),
+      demand_confirmed: demandConfirmed(keywordClassification),
+      demand_confirm_source: demandSource(keywordClassification),
+      mcp_request_status_summary: mcpStatusDetails,
+      mcp_data_status_summary: mcpStatusDetails,
+      new_product_sales_signal: newProductSignal.signal_label,
+      new_product_sales_signal_score: newProductSignal.score,
+      sales_per_review: newProductSignal.sales_per_review,
+      action_flags: newProductSignal.action_flags,
+      score_explanation: newProductSignal.explanation,
+      review_tasks: fieldItems.filter((item) => item.status !== '可用').map((item) => `${item.label}${item.status}`),
+    };
+  };
+
+  const buildSessionFromState = (overrides: Partial<McpValidationSession> = {}): McpValidationSession => {
+    const existing = currentSessionId ? sessions.find((session) => session.id === currentSessionId) : getMcpValidationSessionByAsin(asin);
+    const now = new Date().toISOString();
+    const longTailStatus = sessionStatusFromSnapshots(longTailKeywords, activeKeywordSnapshots, longTailLoading);
+    const longTailResults = activeKeywordSnapshots.filter((snapshot) => snapshot.keyword_type !== 'main');
+    const lastCheckedAt = latestCheckedAt(
+      result.asin_detail?.checked_at,
+      result.asin_prediction?.checked_at,
+      result.traffic_keyword_stat?.checked_at,
+      result.keyword_miner?.checked_at,
+      ...activeKeywordSnapshots.map((snapshot) => snapshot.checked_at),
+    );
+    return {
+      id: existing?.id ?? `${asin.trim().toUpperCase() || 'unknown'}-${Date.now()}`,
+      asin: asin.trim(),
+      main_keyword: mainKeyword.trim(),
+      long_tail_keywords: longTailKeywords,
+      source: existing?.source ?? (initialTitle || initialCategory ? 'mcp_discovery' : 'manual'),
+      created_at: existing?.created_at ?? now,
+      updated_at: now,
+      last_checked_at: lastCheckedAt,
+      asin_detail_status: sectionStatus.asin_detail,
+      asin_prediction_status: sectionStatus.asin_prediction,
+      traffic_keyword_stat_status: sectionStatus.traffic_keyword_stat,
+      keyword_miner_status: sectionStatus.keyword_miner,
+      long_tail_keywords_status: longTailStatus,
+      asin_detail_result: result.asin_detail,
+      asin_prediction_result: result.asin_prediction,
+      traffic_keyword_stat_result: result.traffic_keyword_stat,
+      main_keyword_result: result.keyword_miner,
+      long_tail_keyword_results: longTailResults,
+      keyword_insights: keywordInsights,
+      keyword_data_confidence: keywordClassification.keyword_data_confidence,
+      keyword_source: keywordSourceLabel(keywordClassification),
+      demand_confirmed: demandConfirmed(keywordClassification),
+      demand_confirm_source: demandSource(keywordClassification),
+      mcp_request_status_summary: mcpStatusDetails,
+      mcp_data_status_summary: mcpStatusDetails,
+      raw_responses: {
+        asin_detail: result.asin_detail?.raw ?? null,
+        asin_prediction: result.asin_prediction?.raw ?? null,
+        traffic_keyword_stat: result.traffic_keyword_stat?.raw ?? null,
+        keyword_miner: result.keyword_miner?.raw ?? null,
+        long_tail_keywords: longTailResults.map((snapshot) => snapshot.raw),
+        asin_keywords: asinKeywordRaw,
+      },
+      asin_detail_error: result.asin_detail?.error ?? null,
+      asin_prediction_error: result.asin_prediction?.error ?? null,
+      traffic_keyword_stat_error: result.traffic_keyword_stat?.error ?? null,
+      keyword_miner_error: result.keyword_miner?.error ?? null,
+      long_tail_keyword_errors: longTailResults.map((snapshot) => snapshot.error).filter((error): error is string => Boolean(error)),
+      normalized_snapshot: buildMcpSnapshot(),
+      field_availability: fieldItems,
+      data_flags: fieldItems.filter((item) => item.status === '未返回').map((item) => `${item.group}:${item.field} 未返回`),
+      action_flags: [
+        ...newProductSignal.action_flags,
+        ...fieldItems.filter((item) => item.status === '需要人工补充' || item.status === '需要前台复核').map((item) => `${item.label}${item.status}`),
+      ],
+      score_explanation: newProductSignal.explanation,
+      review_tasks: fieldItems.filter((item) => item.status !== '可用').map((item) => `${item.label}${item.status}`),
+      saved_as_candidate: existing?.saved_as_candidate ?? false,
+      ...overrides,
+    };
+  };
+
+  const persistCurrentSession = (overrides: Partial<McpValidationSession> = {}) => {
+    if (asin.trim().length < 8) return null;
+    const session = buildSessionFromState(overrides);
+    const next = saveMcpValidationSession(session);
+    setSessions(next);
+    setCurrentSessionId(session.id);
+    return session;
+  };
+
+  const applySession = (session: McpValidationSession, notice = '') => {
+    const validation = validationResultFromSession(session);
+    const restoredSnapshots = validation.keyword_snapshots ?? [];
+    setCurrentSessionId(session.id);
+    setAsin(session.asin);
+    setMainKeyword(session.main_keyword);
+    setLongTailText(session.long_tail_keywords.join('\n'));
+    setKeywordSnapshots(restoredSnapshots);
+    setKeywordInsights(session.keyword_insights ?? []);
+    setAsinKeywordStatus(session.keyword_insights?.length ? 'success' : 'idle');
+    setAsinKeywordRaw(session.raw_responses.asin_keywords ?? null);
+    setLongTailSuggestions([]);
+    setSelectedSuggestions([]);
+    setPendingLongTailQuery(false);
+    setSectionStatus({
+      asin_detail: session.asin_detail_status,
+      asin_prediction: session.asin_prediction_status,
+      traffic_keyword_stat: session.traffic_keyword_stat_status,
+      keyword_miner: session.keyword_miner_status,
+    });
+    setResult(validation);
+    setRestoreNotice(notice);
+    setSaveNotice('');
+    setKeywordNotice('');
+  };
+
+  useEffect(() => {
+    if (!persistReadyRef.current) {
+      persistReadyRef.current = true;
+      return;
+    }
+    if (asin.trim().length < 8) return;
+    persistCurrentSession();
+  }, [asin, mainKeyword, longTailText, keywordSnapshots, keywordInsights, asinKeywordStatus, asinKeywordRaw, result, sectionStatus, fieldItems, longTailLoading]);
 
   const updateResult = (patch: Partial<McpValidationResult>) => {
     setResult((current) => ({
@@ -519,33 +939,40 @@ export default function McpValidationPage({
     if (!mainKeyword.trim() && !longTailKeywords.length) setKeywordNotice('未填写关键词，已跳过关键词数据查询。');
   };
 
-  const queryLongTailKeywords = async () => {
-    const keywords = longTailKeywords.slice(0, 10);
+  const queryKeywordMetricsForTerms = async (keywordsInput: string[], skipConfirm = false) => {
+    const keywords = Array.from(new Set(keywordsInput.map((keyword) => keyword.trim()).filter(Boolean))).slice(0, 10);
     if (!keywords.length) {
       setKeywordNotice('请先填写或勾选长尾关键词。');
       return;
     }
-    if (!window.confirm(`本次将查询 ${keywords.length} 个关键词，可能消耗 MCP 额度，是否继续？`)) return;
+    if (!skipConfirm && !window.confirm(`本次将查询 ${keywords.length} 个关键词，可能消耗 MCP 额度，是否继续？`)) return;
     setLongTailLoading(true);
     setKeywordNotice('');
     const snapshots: KeywordSnapshot[] = [];
-    for (const longTailKeyword of keywords) {
-      const result = await fetchKeywordMiner(longTailKeyword);
-      const keywordType = selectedSuggestions.includes(longTailKeyword) ? 'auto_generated' : 'manual';
+    for (const keywordText of keywords) {
+      const result = await fetchKeywordMiner(keywordText);
+      const isMain = keywordText.trim().toLowerCase() === mainKeyword.trim().toLowerCase();
+      const keywordType = isMain ? 'main' : selectedSuggestions.includes(keywordText) ? 'auto_generated' : 'manual';
       snapshots.push(
         normalizeKeywordSnapshot(
-          longTailKeyword,
+          keywordText,
           keywordType,
           result.status === 'success' ? result.data : null,
           result.error,
           result.checked_at,
+          'keyword_miner',
+          result.status === 'success' && result.data ? 'medium' : 'unknown',
         ),
       );
     }
     saveKeywordSnapshotsToResult(snapshots);
     setLongTailLoading(false);
     const failed = snapshots.filter((snapshot) => snapshot.error).length;
-    setKeywordNotice(failed ? `长尾词查询完成，其中 ${failed} 个未成功，其余结果已保留。` : `已查询 ${snapshots.length} 个长尾关键词。`);
+    setKeywordNotice(failed ? `关键词指标查询完成，其中 ${failed} 个未成功，其余结果已保留。` : `已查询 ${snapshots.length} 个关键词指标。`);
+  };
+
+  const queryLongTailKeywords = async () => {
+    await queryKeywordMetricsForTerms(longTailKeywords.slice(0, 10));
   };
 
   const queryAllKeywords = async () => {
@@ -561,6 +988,133 @@ export default function McpValidationPage({
     if (longTailKeywords.length) await queryLongTailKeywords();
   };
 
+  const reverseAsinKeywords = async (skipConfirm = false): Promise<AsinKeywordClassification | null> => {
+    if (!skipConfirm && !confirmMcpCall()) return null;
+    setAsinKeywordStatus('loading');
+    const call = await fetchAsinKeywords(asin, {
+      title: mergedProduct?.title,
+      category: mergedProduct?.category,
+      brand: mergedProduct?.brand,
+    });
+    setAsinKeywordStatus(call.status);
+    setAsinKeywordRaw(call.raw);
+    if (call.status !== 'success') {
+      setKeywordNotice(getMcpFriendlyError(call.error));
+      persistCurrentSession();
+      return null;
+    }
+    const incoming = call.data ?? [];
+    const fallbackInsights = incoming.length
+      ? incoming
+      : insightsFromTitleCandidates({
+          asin,
+          title: mergedProduct?.title,
+          category: mergedProduct?.category,
+          brand: mergedProduct?.brand,
+          mainKeyword,
+        });
+    setKeywordInsights(fallbackInsights);
+    const classified = classifyAsinKeywords({
+      asin,
+      insights: fallbackInsights,
+      title: mergedProduct?.title,
+      category: mergedProduct?.category,
+      brand: mergedProduct?.brand,
+      fallbackMainKeyword: mainKeyword,
+    });
+    if (classified.main_keyword) setMainKeyword(classified.main_keyword);
+    setLongTailText(classified.long_tail_keywords.join('\n'));
+    setKeywordNotice(
+      incoming.length
+        ? `已通过 ASIN 反查识别 ${incoming.length} 个关键词，主词和长尾词已更新。`
+        : 'traffic_keyword/keyword_order 未返回关键词，已使用标题拆词低可信兜底；这些词不作为投放建议。',
+    );
+    return classified;
+  };
+
+  const runStandardValidation = async () => {
+    if (!confirmMcpCall()) return;
+    setKeywordNotice('标准单品验证开始：基础信息 → 销量趋势 → ASIN真实关键词 → 少量关键词指标 → 评分解释。');
+    setResult({ ...emptyResult, asin, keyword: mainKeyword, main_keyword: mainKeyword, long_tail_keywords: longTailKeywords, keyword_snapshots: keywordSnapshots, status: 'loading', checked_at: new Date().toISOString() });
+    setSectionStatus({
+      asin_detail: 'loading',
+      asin_prediction: 'loading',
+      traffic_keyword_stat: 'idle',
+      keyword_miner: 'idle',
+    });
+    await runSection('asin_detail', true);
+    await runSection('asin_prediction', true);
+    const classified = await reverseAsinKeywords(true);
+    if (classified && classified.keyword_data_confidence !== 'low') {
+      const metricTerms = [
+        classified.main_keyword,
+        ...classified.keyword_insights
+          .filter((insight) => insight.source_tool !== 'title_split_fallback' && insight.source_tool !== 'title_generated')
+          .sort((left, right) => right.opportunity_score - left.opportunity_score)
+          .map((insight) => insight.keyword),
+      ]
+        .filter((keyword): keyword is string => Boolean(keyword))
+        .slice(0, 8);
+      if (metricTerms.length) await queryKeywordMetricsForTerms(metricTerms, true);
+    } else if (classified?.keyword_data_confidence === 'low') {
+      setKeywordNotice('标准验证完成基础数据；关键词仅标题拆词兜底，未查询指标，不给高机会分。');
+    }
+    persistCurrentSession();
+  };
+
+  const classifyCurrentKeywords = () => {
+    const fallbackInsights = keywordInsights.length
+      ? keywordInsights
+      : insightsFromTitleCandidates({
+          asin,
+          title: mergedProduct?.title,
+          category: mergedProduct?.category,
+          brand: mergedProduct?.brand,
+          mainKeyword,
+        });
+    const classified = classifyAsinKeywords({
+      asin,
+      insights: fallbackInsights,
+      title: mergedProduct?.title,
+      category: mergedProduct?.category,
+      brand: mergedProduct?.brand,
+      fallbackMainKeyword: mainKeyword,
+    });
+    setKeywordInsights(classified.keyword_insights);
+    if (classified.main_keyword) setMainKeyword(classified.main_keyword);
+    setLongTailText(classified.long_tail_keywords.join('\n'));
+    setKeywordNotice(
+      keywordInsights.length
+        ? '已基于 ASIN 反查结果重新识别主关键词、长尾词和推荐 SP 词。'
+        : '当前仅有标题拆解词，已标记为低可信兜底，建议点击“反查 ASIN 关键词”。',
+    );
+  };
+
+  const queryClassifiedKeywordMetrics = async () => {
+    const classified = classifyAsinKeywords({
+      asin,
+      insights: keywordInsights,
+      title: mergedProduct?.title,
+      category: mergedProduct?.category,
+      brand: mergedProduct?.brand,
+      fallbackMainKeyword: mainKeyword,
+    });
+    if (classified.main_keyword && classified.main_keyword !== mainKeyword) setMainKeyword(classified.main_keyword);
+    if (classified.long_tail_keywords.length) setLongTailText(classified.long_tail_keywords.join('\n'));
+    await queryAllKeywords();
+  };
+
+  const exportCurrentKeywordInsights = () => {
+    const csv = exportKeywordInsightsCsv(keywordClassification.keyword_insights);
+    const blob = new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `asin-keywords-${asin}-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const generateSuggestions = () => {
     const savedProduct = loadProducts().find((product) => product.asin === asin.trim());
     const generated = generateLongTailKeywordCandidates({
@@ -570,8 +1124,19 @@ export default function McpValidationPage({
       main_keyword: mainKeyword,
     });
     setLongTailSuggestions(generated);
+    if (!keywordInsights.length) {
+      setKeywordInsights(
+        insightsFromTitleCandidates({
+          asin,
+          title: mergedProduct?.title ?? savedProduct?.mcp_snapshot?.title ?? savedProduct?.excel.title ?? null,
+          category: mergedProduct?.category ?? savedProduct?.mcp_snapshot?.category ?? savedProduct?.excel.category ?? null,
+          brand: mergedProduct?.brand ?? savedProduct?.mcp_snapshot?.brand ?? savedProduct?.excel.brand ?? null,
+          mainKeyword,
+        }),
+      );
+    }
     setSelectedSuggestions([]);
-    setKeywordNotice(generated.length ? '已根据当前 ASIN 标题和类目生成长尾词建议，可勾选加入列表。' : '当前标题信息不足，暂未生成长尾词建议。');
+    setKeywordNotice(generated.length ? '已根据当前 ASIN 标题和类目生成低可信长尾词建议；建议使用 ASIN 反查关键词确认真实流量词。' : '当前标题信息不足，暂未生成长尾词建议。');
   };
 
   const toggleSuggestion = (keyword: string, checked: boolean) => {
@@ -597,9 +1162,21 @@ export default function McpValidationPage({
     setLongTailSuggestions([]);
     setSelectedSuggestions([]);
     setKeywordSnapshots([]);
+    setKeywordInsights([]);
+    setAsinKeywordStatus('idle');
+    setAsinKeywordRaw(null);
     setKeywordNotice('已切换 ASIN，已清空上一条商品的关键词。');
     setResult({ ...emptyResult, asin: value, keyword: '', main_keyword: '', long_tail_keywords: [], keyword_snapshots: [] });
     setSectionStatus(createInitialSectionStatus());
+    setCurrentSessionId(null);
+    setRestoreNotice('');
+    const historical = value.trim().length >= 8 ? getMcpValidationSessionByAsin(value.trim()) : null;
+    if (historical && promptAsinRef.current !== historical.asin) {
+      promptAsinRef.current = historical.asin;
+      if (window.confirm('发现该 ASIN 历史验证记录，是否恢复？')) {
+        applySession(historical, `已恢复 ASIN ${historical.asin} 的历史 MCP 验证记录。`);
+      }
+    }
   };
 
   useEffect(() => {
@@ -612,39 +1189,19 @@ export default function McpValidationPage({
     setCostInputs((current) => ({ ...current, [key]: value }));
   };
 
-  const buildMcpSnapshot = () => {
-    const hasSuccessData = result.asin_detail?.data || result.asin_prediction?.data || result.keyword_miner?.data || result.traffic_keyword_stat?.data || activeKeywordSnapshots.length;
-    if (!hasSuccessData) return null;
-    return createMcpSnapshotFromValidation({
-      product: mergedProduct,
-      keyword: keywordData,
-      mainKeyword,
-      longTailKeywords,
-      keywordSnapshots: activeKeywordSnapshots,
-      prediction: result.asin_prediction?.data ?? null,
-      traffic: result.traffic_keyword_stat?.data ?? result.traffic_keyword_stat?.raw ?? null,
-      asin: asin.trim(),
-      raw: {
-        asin_detail: result.asin_detail?.raw ?? null,
-        asin_prediction: result.asin_prediction?.raw ?? null,
-        traffic_keyword_stat: result.traffic_keyword_stat?.raw ?? null,
-        keyword_miner: result.keyword_miner?.raw ?? null,
-      },
-    });
-  };
-
   const saveBackToProduct = (markCandidate = false) => {
+    const session = persistCurrentSession({ saved_as_candidate: markCandidate }) ?? buildSessionFromState({ saved_as_candidate: markCandidate });
     const products = loadProducts();
     const nextProducts = upsertProductMcpData({
       products,
-      asin,
-      mcpSnapshot: buildMcpSnapshot(),
-      validation: result,
+      asin: session.asin,
+      mcpSnapshot: buildNormalizedSnapshotFromSession(session) ?? buildMcpSnapshot(),
+      validation: validationResultFromSession(session),
       manualCosts,
       notes,
       markCandidate,
     });
-    const savedProduct = nextProducts.find((product) => product.asin === asin.trim()) ?? null;
+    const savedProduct = nextProducts.find((product) => product.asin === session.asin.trim()) ?? null;
     setSaveNotice(markCandidate ? '已保存为候选商品，并已回填商品 MCP 数据。' : '已保存到当前商品，并已重新计算铺货评分。');
     return savedProduct;
   };
@@ -655,12 +1212,13 @@ export default function McpValidationPage({
   };
 
   const saveCandidate = () => {
+    const session = persistCurrentSession({ saved_as_candidate: true }) ?? buildSessionFromState({ saved_as_candidate: true });
     const savedProduct = saveBackToProduct(true);
     const record = createCandidateRecord({
-      asin: asin.trim(),
-      keyword: mainKeyword.trim(),
+      asin: session.asin.trim(),
+      keyword: session.main_keyword.trim(),
       product: savedProduct,
-      validation: result,
+      validation: validationResultFromSession(session),
       costs: manualCosts,
       margin: marginSnapshot,
       notes,
@@ -678,12 +1236,13 @@ export default function McpValidationPage({
   };
 
   const updateCandidate = (id: string) => {
+    const session = persistCurrentSession({ saved_as_candidate: true }) ?? buildSessionFromState({ saved_as_candidate: true });
     const savedProduct = saveBackToProduct(true);
     const replacement = createCandidateRecord({
-      asin: asin.trim(),
-      keyword: mainKeyword.trim(),
+      asin: session.asin.trim(),
+      keyword: session.main_keyword.trim(),
       product: savedProduct,
-      validation: result,
+      validation: validationResultFromSession(session),
       costs: manualCosts,
       margin: marginSnapshot,
       notes,
@@ -705,6 +1264,47 @@ export default function McpValidationPage({
     link.download = `mcp-candidates-${new Date().toISOString().slice(0, 10)}.csv`;
     link.click();
     URL.revokeObjectURL(url);
+  };
+
+  const saveCandidateFromSession = (session: McpValidationSession) => {
+    applySession(session, `已恢复 ASIN ${session.asin}，并准备保存为候选。`);
+    const products = loadProducts();
+    const snapshot = buildNormalizedSnapshotFromSession(session);
+    const validation = validationResultFromSession(session);
+    const nextProducts = upsertProductMcpData({
+      products,
+      asin: session.asin,
+      mcpSnapshot: snapshot,
+      validation,
+      manualCosts,
+      notes,
+      markCandidate: true,
+    });
+    const savedProduct = nextProducts.find((product) => product.asin === session.asin) ?? null;
+    const record = createCandidateRecord({
+      asin: session.asin,
+      keyword: session.main_keyword,
+      product: savedProduct,
+      validation,
+      costs: manualCosts,
+      margin: savedProduct ? calculateMarginSnapshot(savedProduct.mcp_snapshot, manualCosts) : marginSnapshot,
+      notes,
+    });
+    const nextCandidates = [record, ...candidates.filter((candidate) => candidate.asin !== session.asin)].slice(0, 50);
+    setCandidates(nextCandidates);
+    saveCandidates(nextCandidates);
+    setSessions(saveMcpValidationSession({ ...session, saved_as_candidate: true }));
+    setSaveNotice('已从验证历史保存为候选商品。');
+  };
+
+  const removeSession = (sessionId: string) => {
+    if (!window.confirm('删除后将无法从 MCP验证页恢复该记录，是否继续？')) return;
+    const next = deleteMcpValidationSession(sessionId);
+    setSessions(next);
+    if (currentSessionId === sessionId) {
+      setCurrentSessionId(null);
+      setRestoreNotice('');
+    }
   };
 
   return (
@@ -744,37 +1344,10 @@ export default function McpValidationPage({
             </div>
           </div>
         )}
-        <div className="action-row">
-          <button type="button" onClick={() => runSection('asin_detail')} disabled={isLoading}>
-            查询 ASIN 详情
+        <div className="action-row validation-main-actions">
+          <button className="primary-button validation-primary-button" type="button" onClick={runStandardValidation} disabled={isLoading || longTailLoading || asinKeywordStatus === 'loading'}>
+            {isLoading || longTailLoading || asinKeywordStatus === 'loading' ? '标准验证中' : '开始标准单品验证'}
           </button>
-          <button type="button" onClick={() => runSection('asin_prediction')} disabled={isLoading}>
-            查询 ASIN 销量趋势
-          </button>
-          <button type="button" onClick={() => runSection('traffic_keyword_stat')} disabled={isLoading}>
-            查询 ASIN 流量关键词统计
-          </button>
-          <button type="button" onClick={() => runSection('keyword_miner')} disabled={isLoading}>
-            查询主关键词数据
-          </button>
-          <button type="button" onClick={queryLongTailKeywords} disabled={isLoading || longTailLoading}>
-            {longTailLoading ? '长尾词查询中' : '查询长尾关键词数据'}
-          </button>
-          <button type="button" onClick={queryAllKeywords} disabled={isLoading || longTailLoading}>
-            一键查询全部关键词
-          </button>
-          <button type="button" onClick={generateSuggestions} disabled={isLoading}>
-            自动生成长尾词建议
-          </button>
-          <button type="button" onClick={clearLongTailKeywords} disabled={isLoading || longTailLoading}>
-            清空长尾词
-          </button>
-          <button className="primary-button" type="button" onClick={runAll} disabled={isLoading}>
-            一键小样本验证
-          </button>
-        </div>
-        {keywordNotice && <p className="save-notice">{keywordNotice}</p>}
-        <div className="action-row">
           <button type="button" onClick={() => saveBackToProduct(false)}>
             保存到当前商品
           </button>
@@ -785,14 +1358,62 @@ export default function McpValidationPage({
             更新商品 MCP 数据
           </button>
         </div>
-        <div className="status-grid">
-          {Object.entries(sectionStatus).map(([section, status]) => (
-            <div className={`status-pill status-${status}`} key={section}>
-              <span>{section}</span>
-              <strong>{statusText(status)}</strong>
-            </div>
-          ))}
+        <details className="advanced-panel">
+          <summary>高级调试/批量抽样</summary>
+          <p>这里用于排查字段、补查单个工具或批量抽检；日常单品验证优先点击上面的主按钮。</p>
+          <div className="action-row">
+            <button type="button" onClick={() => runSection('asin_detail')} disabled={isLoading}>
+              查询 ASIN 详情
+            </button>
+            <button type="button" onClick={() => runSection('asin_prediction')} disabled={isLoading}>
+              查询 ASIN 销量预测
+            </button>
+            <button type="button" onClick={() => runSection('traffic_keyword_stat')} disabled={isLoading}>
+              查询 ASIN 流量关键词统计
+            </button>
+            <button type="button" onClick={() => reverseAsinKeywords()} disabled={isLoading || longTailLoading || asinKeywordStatus === 'loading'}>
+              {asinKeywordStatus === 'loading' ? '反查中' : '反查 ASIN 关键词'}
+            </button>
+            <button type="button" onClick={() => runSection('keyword_miner')} disabled={isLoading}>
+              查询主关键词指标
+            </button>
+            <button type="button" onClick={queryLongTailKeywords} disabled={isLoading || longTailLoading}>
+              {longTailLoading ? '长尾词查询中' : '查询选中长尾词指标'}
+            </button>
+            <button type="button" onClick={classifyCurrentKeywords} disabled={isLoading || longTailLoading}>
+              识别主关键词和长尾词
+            </button>
+            <button type="button" onClick={queryClassifiedKeywordMetrics} disabled={isLoading || longTailLoading}>
+              查询关键词指标
+            </button>
+            <button type="button" onClick={exportCurrentKeywordInsights} disabled={!keywordClassification.keyword_insights.length}>
+              导出关键词
+            </button>
+            <button type="button" onClick={generateSuggestions} disabled={isLoading}>
+              重新生成标题拆词
+            </button>
+            <button type="button" onClick={clearLongTailKeywords} disabled={isLoading || longTailLoading}>
+              清空关键词
+            </button>
+            <button type="button" onClick={queryAllKeywords} disabled={isLoading || longTailLoading}>
+              一键查询全部关键词
+            </button>
+            <button type="button" onClick={runAll} disabled={isLoading}>
+              批量抽样验证（高级）
+            </button>
+          </div>
+        </details>
+        {keywordNotice && <p className="save-notice">{keywordNotice}</p>}
+        {restoreNotice && <p className="save-notice">{restoreNotice}</p>}
+        <div className="product-identity-strip">
+          <ProductThumbnail src={mainImageCandidate.url} asin={asin} title={mergedProduct?.title} size="table" />
+          <div>
+            <strong>{asin || '未填写 ASIN'}</strong>
+            <span>{mergedProduct?.title || '完成 ASIN 详情查询后展示标题与主图'}</span>
+            <small>主图来源：{mainImageCandidate.source ?? '未识别'} · 当前验证结果会保存到 MCP session</small>
+          </div>
         </div>
+        <McpFlowStatus details={mcpStatusDetails} />
         {errors.length > 0 && (
           <div className="error-box">
             {errors.slice(-4).map((error, index) => (
@@ -800,6 +1421,56 @@ export default function McpValidationPage({
             ))}
           </div>
         )}
+      </section>
+
+      <section className="content-section">
+        <div className="section-heading">
+          <h2>ASIN 关键词反查</h2>
+          <p>
+            优先使用 ASIN 真实流量词、广告词、推荐词和转化词。标题拆词仅为低可信兜底，不直接作为投放建议。
+          </p>
+        </div>
+        <div className="keyword-opportunity-summary">
+          <Metric label="主关键词" value={keywordClassification.main_keyword || '待识别'} />
+          <Metric label="关键词可信度" value={confidenceLabel(keywordClassification.keyword_data_confidence)} />
+          <Metric label="关键词来源" value={keywordSourceLabel(keywordClassification)} />
+          <Metric label="需求确认" value={demandConfirmed(keywordClassification) === true ? '已确认' : demandConfirmed(keywordClassification) === 'partial' ? '部分确认' : '待确认'} />
+          <Metric label="推荐 SP 词" value={String(keywordClassification.recommended_sp_keywords.length)} />
+          <Metric label="长尾机会" value={longTailOpportunityLabel(keywordClassification.long_tail_opportunity_level)} />
+        </div>
+        {keywordClassification.keyword_data_confidence === 'low' && (
+          <div className="warning-list">
+            <p>当前关键词仅来自标题拆解，未完成 ASIN 反查，广告判断可信度较低。</p>
+          </div>
+        )}
+        <KeywordInsightTable insights={keywordClassification.keyword_insights} />
+        <div className="compare-grid keyword-recommend-grid">
+          <KeywordTextPanel title="推荐 SP 测试词" items={keywordClassification.keyword_insights.filter((insight) => keywordClassification.recommended_sp_keywords.includes(insight.keyword)).slice(0, 10)} empty="待 ASIN 反查或关键词指标确认。" />
+          <KeywordTextPanel title="不建议词" items={keywordClassification.keyword_insights.filter((insight) => Boolean(insight.reject_reason)).slice(0, 12)} empty="暂无明确不建议词。" rejected />
+        </div>
+      </section>
+
+      <section className="content-section">
+        <div className="section-heading">
+          <h2>新品动销与分层解释</h2>
+          <p>0评论/少评论但有销量会优先识别为机会；缺失数据只标记待复核，不直接当作差品。</p>
+        </div>
+        <div className="keyword-opportunity-summary">
+          <Metric label="新品动销信号" value={newProductSignal.signal_label} />
+          <Metric label="新品动销分" value={`${newProductSignal.score}/30`} />
+          <Metric label="动销/评论比" value={valueLabel(newProductSignal.sales_per_review)} />
+          <Metric label="有效评论来源" value={reviewSourceLabel(effectiveReviewMeta.review_count_source)} />
+          <Metric label="销量置信度" value={salesConfidencePreview} />
+          <Metric label="变体风险" value={variationRiskPreview} />
+        </div>
+        <div className="warning-list">
+          {newProductSignal.explanation.map((item) => (
+            <p key={item}>{item}</p>
+          ))}
+          {newProductSignal.action_flags.map((item) => (
+            <p key={item}><strong>{item}</strong></p>
+          ))}
+        </div>
       </section>
 
       <section className="content-section">
@@ -933,16 +1604,19 @@ export default function McpValidationPage({
         )}
         {candidates.length ? (
           <div className="candidate-list">
-            {candidates.map((candidate) => (
-              <div className="candidate-card" key={candidate.id}>
-                <div>
-                  <strong>{candidate.asin || '未填写 ASIN'}</strong>
-                  <span>{candidate.keyword || '未填写关键词'}</span>
-                  <span>前台复核：{candidate.front_review?.front_review_level || candidate.front_review_status || '未开始'}</span>
-                  <span>最终建议：{candidate.final_advice || '待复核'}</span>
-                  <span>负责人：{candidate.front_review?.reviewer || '未填写'}</span>
-                  <small>{new Date(candidate.saved_at).toLocaleString()}</small>
-                </div>
+	              {candidates.map((candidate) => (
+	              <div className="candidate-card" key={candidate.id}>
+	                <div className="candidate-card-heading">
+	                  <ProductThumbnail src={candidateImageUrl(candidate)} asin={candidate.asin} title={candidate.mcp_result?.title ?? candidate.excel_result?.title ?? null} size="small" />
+	                  <div>
+	                    <strong>{candidate.asin || '未填写 ASIN'}</strong>
+	                    <span>{candidate.keyword || '未填写关键词'}</span>
+	                    <span>前台复核：{candidate.front_review?.front_review_level || candidate.front_review_status || '未开始'}</span>
+	                    <span>最终建议：{candidate.final_advice || '待复核'}</span>
+	                    <span>负责人：{candidate.front_review?.reviewer || '未填写'}</span>
+	                    <small>{new Date(candidate.saved_at).toLocaleString()}</small>
+	                  </div>
+	                </div>
                 <div className="candidate-metrics">
                   <Metric label="目标价" value={formatMoney(candidate.margin.target_price)} />
                   <Metric label="平台后毛利" value={formatPercent(candidate.margin.platform_margin_rate)} tone={candidate.margin.platform_margin_pass ? 'good' : 'warn'} />
@@ -967,6 +1641,58 @@ export default function McpValidationPage({
         ) : (
           <div className="empty-state">暂无候选记录。完成小样本验证和成本录入后，可以手动保存。</div>
         )}
+      </section>
+
+      <section className="content-section">
+        <div className="section-heading">
+          <h2>最近验证记录</h2>
+          <p>最近 20 条 MCP 单品验证会话会自动保存在当前浏览器，切换页面后可恢复查看。</p>
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>ASIN</th>
+                <th>主关键词</th>
+                <th>长尾词</th>
+                <th>asin_detail</th>
+                <th>asin_prediction</th>
+                <th>traffic_keyword_stat</th>
+                <th>keyword_miner</th>
+                <th>已候选</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sessions.slice(0, 20).map((session) => (
+                <tr key={session.id}>
+                  <td>{new Date(session.updated_at).toLocaleString()}</td>
+                  <td>{session.asin}</td>
+                  <td>{session.main_keyword || '未填写'}</td>
+                  <td>{session.long_tail_keywords.length} 个</td>
+                  <td>{statusText(session.asin_detail_status)}</td>
+                  <td>{statusText(session.asin_prediction_status)}</td>
+                  <td>{statusText(session.traffic_keyword_stat_status)}</td>
+                  <td>{statusText(session.keyword_miner_status)}</td>
+                  <td>{session.saved_as_candidate ? '是' : '否'}</td>
+                  <td className="table-actions">
+                    <button className="secondary-button" type="button" onClick={() => applySession(session, `已恢复 ASIN ${session.asin} 的 MCP 验证记录。`)}>
+                      恢复查看
+                    </button>
+                    <button className="secondary-button" type="button" onClick={() => saveCandidateFromSession(session)}>
+                      保存为候选
+                    </button>
+                    <button className="secondary-button danger-button" type="button" onClick={() => removeSession(session.id)}>
+                      删除记录
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!sessions.length && <div className="empty-state">暂无 MCP 验证历史。</div>}
+        </div>
       </section>
 
       <section className="content-section">
@@ -1001,14 +1727,24 @@ export default function McpValidationPage({
 
       <section className="content-section">
         <div className="section-heading">
+          <h2>主图 URL 对比</h2>
+          <p>从 ASIN 详情、销量趋势和 raw response 中自动识别主图字段，方便排查表格缩略图来源。</p>
+        </div>
+        <MainImageUrlPanel candidate={mainImageCandidate} />
+      </section>
+
+      <section className="content-section">
+        <div className="section-heading">
           <h2>原始 raw response</h2>
         </div>
         <div className="raw-stack">
           <RawBlock title="asin_detail raw" raw={result.asin_detail?.raw ?? null} />
           <RawBlock title="asin_prediction raw" raw={result.asin_prediction?.raw ?? null} />
           <RawBlock title="traffic_keyword_stat raw" raw={result.traffic_keyword_stat?.raw ?? null} />
+          <RawBlock title="asin_keywords raw" raw={asinKeywordRaw} />
           <RawBlock title="keyword_miner raw" raw={result.keyword_miner?.raw ?? null} />
-          <RawBlock title="keyword_snapshots raw" raw={activeKeywordSnapshots} />
+          <RawBlock title="long_tail_keywords raw list" raw={activeKeywordSnapshots.filter((snapshot) => snapshot.keyword_type !== 'main').map((snapshot) => snapshot.raw)} />
+          <RawBlock title="keyword_snapshots parsed" raw={activeKeywordSnapshots} />
         </div>
       </section>
     </div>
@@ -1030,6 +1766,7 @@ const productFields: Array<[keyof McpProductSnapshot, string]> = [
   ['fba_fee', 'FBA费用'],
   ['referral_fee', '平台佣金'],
   ['referral_fee_rate', '佣金比例'],
+  ['main_image_url', '主图 URL'],
   ['seller', '卖家'],
   ['seller_type', '卖家类型'],
   ['variation_count', '变体数'],
@@ -1102,6 +1839,180 @@ function KeywordSnapshotTable({ snapshots }: { snapshots: KeywordSnapshot[] }) {
   );
 }
 
+function KeywordInsightTable({ insights }: { insights: AsinKeywordInsight[] }) {
+  if (!insights.length) return <div className="empty-state">暂未反查 ASIN 关键词。可点击“反查 ASIN 关键词”。</div>;
+  return (
+    <div className="table-wrap keyword-table">
+      <table>
+        <thead>
+          <tr>
+            <th>关键词</th>
+            <th>来源</th>
+            <th>可信度</th>
+            <th>类型</th>
+            <th>搜索量</th>
+            <th>PPC</th>
+            <th>购买率</th>
+            <th>标题密度</th>
+            <th>广告竞品</th>
+            <th>机会分</th>
+            <th>建议</th>
+            <th>数据状态</th>
+          </tr>
+        </thead>
+        <tbody>
+          {insights.slice(0, 50).map((insight) => (
+            <tr key={`${insight.source_tool}-${insight.keyword}`}>
+              <td>{insight.keyword}</td>
+              <td>{sourceToolLabel(insight.source_tool)}</td>
+              <td>{confidenceLabel(insight.data_confidence)}</td>
+              <td>{insightTypeLabel(insight.keyword_type)}</td>
+              <td>{valueLabel(insight.search_volume)}</td>
+              <td>{formatMoney(insight.ppc_bid)}</td>
+              <td>{formatPercent(insight.purchase_rate)}</td>
+              <td>{valueLabel(insight.title_density)}</td>
+              <td>{valueLabel(insight.ad_competitor_count)}</td>
+              <td>{insight.data_confidence === 'low' ? '未评分' : insight.opportunity_score}</td>
+              <td>{insight.recommended_action || insight.reject_reason || (insight.data_confidence === 'low' ? '待 ASIN 反查或关键词指标确认' : '待观察')}</td>
+              <td>{keywordInsightDataStatus(insight)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function McpFlowStatus({ details }: { details: McpCallStatusDetail[] }) {
+  return (
+    <div className="mcp-flow-status">
+      {details.map((detail) => (
+        <div className={`flow-card flow-request-${detail.request_status} flow-data-${detail.data_status}`} key={detail.tool}>
+          <span>{detail.label}</span>
+          <strong>{requestStatusLabel(detail.request_status)} / {dataStatusLabel(detail.data_status)}</strong>
+          <small>
+            {typeof detail.items_count === 'number' ? `${detail.items_count} 条` : '未计数'}
+            {detail.warning_message ? ` · ${detail.warning_message}` : ''}
+            {detail.error_message ? ` · ${getMcpFriendlyError(detail.error_message)}` : ''}
+          </small>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function requestStatusLabel(status: McpRequestStatus): string {
+  const labels: Record<McpRequestStatus, string> = {
+    idle: '未查询',
+    running: '查询中',
+    success: '接口成功',
+    failed: '接口失败',
+    skipped: '已跳过',
+  };
+  return labels[status];
+}
+
+function dataStatusLabel(status: McpDataStatus): string {
+  const labels: Record<McpDataStatus, string> = {
+    unknown: '数据未知',
+    has_data: '有可用数据',
+    empty: '成功但无数据',
+    partial: '数据不完整',
+    invalid: '结构异常',
+    not_requested: '未查询',
+  };
+  return labels[status];
+}
+
+function KeywordTextPanel({ title, items, empty, rejected = false }: { title: string; items: AsinKeywordInsight[]; empty: string; rejected?: boolean }) {
+  return (
+    <div className="keyword-list-panel">
+      <div className="section-heading">
+        <h2>{title}</h2>
+      </div>
+      {items.length ? (
+        <div className="warning-list">
+          {items.map((item) => (
+            <p key={`${title}-${item.keyword}`}>
+              <strong>{item.keyword}</strong>：{rejected ? item.reject_reason || '不建议' : item.recommended_action || 'Exact 小预算测试'}，机会分 {item.opportunity_score}
+            </p>
+          ))}
+        </div>
+      ) : (
+        <p>{empty}</p>
+      )}
+    </div>
+  );
+}
+
+function keywordInsightDataStatus(insight: AsinKeywordInsight): string {
+  if (insight.error) return '查询失败';
+  if (insight.data_confidence === 'low') return '标题拆词兜底，待验证';
+  const hasMetric = [
+    insight.search_volume,
+    insight.purchase_volume,
+    insight.purchase_rate,
+    insight.ppc_bid,
+    insight.title_density,
+    insight.ad_competitor_count,
+    insight.traffic_share,
+    insight.conversion_share,
+  ].some((value) => typeof value === 'number' && Number.isFinite(value));
+  return hasMetric ? '有指标' : '成功但指标为空';
+}
+
+function confidenceLabel(confidence: string): string {
+  const labels: Record<string, string> = {
+    high: '高：ASIN反查 + 指标',
+    medium_high: '中高：出单词反查',
+    medium: '中：部分反查/指标',
+    low: '低：标题拆词兜底',
+    unknown: '未知：待查询',
+  };
+  return labels[confidence] ?? confidence;
+}
+
+function sourceToolLabel(source: AsinKeywordInsight['source_tool']): string {
+  const labels: Record<AsinKeywordInsight['source_tool'], string> = {
+    traffic_keyword: '流量词反查',
+    traffic_keyword_stat: '流量统计',
+    keyword_order: '转化词反查',
+    traffic_extend: '相关扩展词',
+    keyword_miner: '关键词挖掘',
+    keyword_research: '关键词研究',
+    title_generated: '标题拆解',
+    title_split_fallback: '标题拆词兜底',
+    manual: '手动',
+  };
+  return labels[source];
+}
+
+function reviewSourceLabel(source: 'ratings' | 'reviews' | 'raw_review_count' | 'missing'): string {
+  const labels: Record<'ratings' | 'reviews' | 'raw_review_count' | 'missing', string> = {
+    ratings: 'ratings评分数',
+    reviews: 'reviews评论数',
+    raw_review_count: 'review_count',
+    missing: '未返回',
+  };
+  return labels[source];
+}
+
+function insightTypeLabel(type: AsinKeywordInsight['keyword_type']): string {
+  const labels: Record<AsinKeywordInsight['keyword_type'], string> = {
+    main: '主关键词',
+    long_tail: '长尾词',
+    natural: '自然词',
+    ads: '广告词',
+    recommended: '推荐词',
+    converting: '转化词',
+    brand: '品牌词',
+    invalid: '无效词',
+    auto_generated: '标题建议',
+    unknown: '未知',
+  };
+  return labels[type];
+}
+
 function keywordTypeLabel(type: KeywordSnapshot['keyword_type']): string {
   const labels: Record<KeywordSnapshot['keyword_type'], string> = {
     main: '主关键词',
@@ -1114,6 +2025,7 @@ function keywordTypeLabel(type: KeywordSnapshot['keyword_type']): string {
 
 function keywordSnapshotVerdict(snapshot: KeywordSnapshot): string {
   if (snapshot.error) return '查询失败';
+  if (snapshot.source_tool === 'title_generated' || snapshot.source_tool === 'title_split_fallback' || snapshot.data_confidence === 'low') return '标题拆词，仅临时参考';
   const searchFit = (snapshot.search_volume ?? 0) >= 300 && (snapshot.search_volume ?? 0) <= 5000;
   const ppcFit = typeof snapshot.ppc_bid === 'number' && snapshot.ppc_bid <= 1;
   const competitionFit = (snapshot.ad_competitor_count ?? Number.POSITIVE_INFINITY) <= 100 && (snapshot.title_density ?? Number.POSITIVE_INFINITY) <= 50;
@@ -1136,6 +2048,34 @@ function Metric({ label, value, tone }: { label: string; value: string; tone?: '
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
+  );
+}
+
+function MainImageUrlPanel({ candidate }: { candidate: { url: string | null; source: string | null } }) {
+  if (!candidate.url) {
+    return <div className="empty-state">MCP raw response 暂未识别到有效主图 URL，找品结果会显示“无图”。</div>;
+  }
+
+  return (
+    <div className="main-image-url-panel">
+      <ProductThumbnail src={candidate.url} title="当前 ASIN 主图" size="table" />
+      <div>
+        <span className="field-group">识别来源：{candidate.source ?? '自动识别'}</span>
+        <a className="image-url-text" href={candidate.url} target="_blank" rel="noreferrer" title={candidate.url}>
+          {candidate.url}
+        </a>
+      </div>
+    </div>
+  );
+}
+
+function candidateImageUrl(candidate: McpCandidateRecord): string | null {
+  return (
+    candidate.mcp_result?.main_image_url ??
+    candidate.product?.main_image_url ??
+    candidate.discovery_product?.main_image_url ??
+    extractImageCandidate(candidate.discovery_product?.raw).url ??
+    extractImageCandidate(candidate.validation).url
   );
 }
 

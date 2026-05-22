@@ -1,5 +1,6 @@
 import type {
   AmazonCategoryNode,
+  AsinKeywordInsight,
   CategorySelection,
   DiscoveryFilters,
   McpCallStatus,
@@ -10,9 +11,40 @@ import type {
   McpProductSnapshot,
   McpToolCallResult,
 } from '../types/mcp';
+import { extractImageUrl } from './imageTools';
+import { normalizeAsinKeywordInsights } from './keywordTools';
 
 const DEFAULT_MARKETPLACE = 'US';
 const REQUEST_TIMEOUT_MS = 90_000;
+
+const imageReturnFields = [
+  'imageUrl',
+  'image_url',
+  'mainImage',
+  'main_image',
+  'main_image_url',
+  'primaryImage',
+  'primary_image',
+  'primary_image_url',
+  'thumbnail',
+  'thumbnailUrl',
+  'thumbnail_url',
+  'smallImage',
+  'largeImage',
+  'imgUrl',
+  'img_url',
+  'picUrl',
+  'pictureUrl',
+  'images',
+  'imageUrls',
+  'image_urls',
+  'imageList',
+  'media',
+  'mediaList',
+  'pictures',
+  'photos',
+  'gallery',
+];
 
 type McpBridge = {
   callTool?: (tool: string, payload: unknown) => Promise<unknown>;
@@ -20,7 +52,11 @@ type McpBridge = {
   asin_detail?: (payload: unknown) => Promise<unknown>;
   asin_prediction?: (payload: unknown) => Promise<unknown>;
   traffic_keyword_stat?: (payload: unknown) => Promise<unknown>;
+  traffic_keyword?: (payload: unknown) => Promise<unknown>;
+  keyword_order?: (payload: unknown) => Promise<unknown>;
+  traffic_extend?: (payload: unknown) => Promise<unknown>;
   keyword_miner?: (payload: unknown) => Promise<unknown>;
+  keyword_research?: (payload: unknown) => Promise<unknown>;
   competitor_lookup?: (payload: unknown) => Promise<unknown>;
   product_node?: (payload: unknown) => Promise<unknown>;
   product_research?: (payload: unknown) => Promise<unknown>;
@@ -87,6 +123,7 @@ const productReturnFields = [
   'totalAmount',
   'revenue',
   'amzSales',
+  ...imageReturnFields,
 ].join(',');
 
 const predictionReturnFields = [
@@ -123,6 +160,7 @@ const marketProductReturnFields = [
   'sellerName',
   'variations',
   'fulfillment',
+  ...imageReturnFields,
 ].join(',');
 
 const keywordReturnFields = [
@@ -147,6 +185,34 @@ const keywordReturnFields = [
   'relevancy',
 ].join(',');
 
+const asinKeywordReturnFields = [
+  'keyword',
+  'keywordCn',
+  'searches',
+  'searchVolume',
+  'purchases',
+  'purchaseVolume',
+  'purchaseRate',
+  'bid',
+  'ppcBid',
+  'products',
+  'adProducts',
+  'adProduct',
+  'latest1daysAds',
+  'titleDensity',
+  'trafficPercentage',
+  'conversionRate',
+  'sumConversionRate',
+  'rankPosition',
+  'naturalRank',
+  'adRank',
+  'adPosition',
+  'relationAsin',
+  'monopolyClickRate',
+  'spr',
+  'supplyDemandRatio',
+].join(',');
+
 const discoveryReturnFields = [
   'asin',
   'parent',
@@ -164,7 +230,18 @@ const discoveryReturnFields = [
   'rating',
   'bsr',
   'fba',
+  'sellerId',
+  'seller_id',
+  'merchantId',
+  'merchant_id',
+  'shopId',
   'sellerName',
+  'seller',
+  'shopName',
+  'storefrontUrl',
+  'storefront_url',
+  'sellerUrl',
+  'shopUrl',
   'fulfillment',
   'variations',
   'badge',
@@ -180,6 +257,7 @@ const discoveryReturnFields = [
   'product_age_days',
   'listedDays',
   'listed_days',
+  ...imageReturnFields,
 ].join(',');
 
 const categoryNodeReturnFields = [
@@ -263,7 +341,11 @@ async function invokeMcpTool(tool: string, payload: unknown): Promise<McpToolCal
         asin_detail: bridge?.asin_detail,
         asin_prediction: bridge?.asin_prediction,
         traffic_keyword_stat: bridge?.traffic_keyword_stat,
+        traffic_keyword: bridge?.traffic_keyword,
+        keyword_order: bridge?.keyword_order,
+        traffic_extend: bridge?.traffic_extend,
         keyword_miner: bridge?.keyword_miner,
+        keyword_research: bridge?.keyword_research,
         competitor_lookup: bridge?.competitor_lookup,
         product_node: bridge?.product_node,
         product_research: bridge?.product_research,
@@ -337,15 +419,78 @@ function asRecord(raw: unknown): Record<string, unknown> {
   return payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : {};
 }
 
-function asObjectArray(raw: unknown): Array<Record<string, unknown>> {
+function readPath(raw: unknown, path: string[]): unknown {
+  let current = raw;
+  for (const key of path) {
+    if (!current || typeof current !== 'object') return null;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current;
+}
+
+function extractObjectArrayWithPath(raw: unknown): { items: Array<Record<string, unknown>>; path: string } {
   const payload = unwrapMcpPayload(raw);
   if (Array.isArray(payload)) {
-    return payload.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'));
+    return {
+      items: payload.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object')),
+      path: 'array',
+    };
   }
-  const record = asRecord(payload);
-  return Array.isArray(record.items)
-    ? record.items.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
-    : [];
+
+  const candidates: Array<{ path: string; value: unknown }> = [
+    { path: 'items', value: readPath(payload, ['items']) },
+    { path: 'records', value: readPath(payload, ['records']) },
+    { path: 'list', value: readPath(payload, ['list']) },
+    { path: 'data.items', value: readPath(payload, ['data', 'items']) },
+    { path: 'data.records', value: readPath(payload, ['data', 'records']) },
+    { path: 'data.list', value: readPath(payload, ['data', 'list']) },
+    { path: 'result.items', value: readPath(payload, ['result', 'items']) },
+    { path: 'result.records', value: readPath(payload, ['result', 'records']) },
+    { path: 'data.data.items', value: readPath(payload, ['data', 'data', 'items']) },
+    { path: 'data.data.records', value: readPath(payload, ['data', 'data', 'records']) },
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate.value)) {
+      return {
+        items: candidate.value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object')),
+        path: candidate.path,
+      };
+    }
+  }
+  return { items: [], path: 'not_found' };
+}
+
+function pickTotal(raw: unknown): number | null {
+  const payload = unwrapMcpPayload(raw);
+  const candidates = [
+    readPath(payload, ['total']),
+    readPath(payload, ['totalCount']),
+    readPath(payload, ['count']),
+    readPath(payload, ['data', 'total']),
+    readPath(payload, ['data', 'totalCount']),
+    readPath(payload, ['result', 'total']),
+    readPath(payload, ['data', 'data', 'total']),
+  ];
+  for (const value of candidates) {
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
+function summarizeMcpListResponse(raw: unknown): Record<string, unknown> {
+  const extracted = extractObjectArrayWithPath(raw);
+  return {
+    total: pickTotal(raw),
+    items_count: extracted.items.length,
+    detected_items_path: extracted.path,
+    first_item_keys: extracted.items[0] ? Object.keys(extracted.items[0]).slice(0, 20) : [],
+  };
+}
+
+function asObjectArray(raw: unknown): Array<Record<string, unknown>> {
+  return extractObjectArrayWithPath(raw).items;
 }
 
 function pick(raw: unknown, keys: string[]): unknown {
@@ -536,6 +681,7 @@ function normalizeDiscoveredProduct(raw: Record<string, unknown>, source: Catego
   const firstAvailableDate = pickIsoDate(raw, ['first_available_date', 'firstAvailableDate', 'firstAvailableAt', 'availableDate']);
   const productAgeDays = normalizeProductAgeDays(raw, listedAt, launchDate, firstAvailableDate);
   const listedDays = pickNumber(raw, ['listed_days', 'listedDays', 'listingDays', 'availableDays']) ?? productAgeDays;
+  const mainImageUrl = extractImageUrl(raw);
   return {
     asin,
     parent_asin: pickString(raw, ['parent', 'parentAsin', 'parent_asin']),
@@ -558,6 +704,8 @@ function normalizeDiscoveredProduct(raw: Record<string, unknown>, source: Catego
     is_amazon: amazon,
     variation_count: countVariations(raw),
     product_url: `https://www.amazon.com/dp/${asin}`,
+    main_image_url: mainImageUrl,
+    main_image_source: mainImageUrl ? 'mcp' : 'missing',
     listed_at: listedAt,
     launch_date: launchDate,
     first_available_date: firstAvailableDate,
@@ -574,6 +722,29 @@ function normalizeDiscoveredProduct(raw: Record<string, unknown>, source: Catego
   };
 }
 
+function normalizeSellerStoreProduct(raw: Record<string, unknown>, sellerKey: string, sourceKeyword = ''): McpDiscoveredProduct | null {
+  const sellerName = pickString(raw, ['sellerName', 'seller', 'shopName']) ?? sellerKey;
+  const product = normalizeDiscoveredProduct(
+    raw,
+    {
+      node_id: sellerKey,
+      name: sellerName,
+      path: `店铺 > ${sellerName}`,
+      level: 0,
+      is_leaf: false,
+      selected_at: nowIso(),
+    },
+    sourceKeyword,
+  );
+  if (!product) return null;
+  return {
+    ...product,
+    source_type: 'seller_store',
+    source_node_id: sellerKey,
+    source_category_path: product.category_path ?? `店铺 > ${sellerName}`,
+  };
+}
+
 function prefer<T>(...values: Array<T | null | undefined>): T | null {
   return values.find((value): value is T => value !== null && value !== undefined) ?? null;
 }
@@ -583,6 +754,7 @@ function mergeProductSnapshots(
   market: McpProductSnapshot | null,
   raw: unknown,
 ): McpProductSnapshot {
+  const mainImageUrl = prefer(detail?.main_image_url, market?.main_image_url, extractImageUrl(raw));
   return {
     asin: prefer(detail?.asin, market?.asin),
     title: prefer(detail?.title, market?.title),
@@ -598,6 +770,8 @@ function mergeProductSnapshots(
     fba_fee: prefer(market?.fba_fee, detail?.fba_fee),
     referral_fee: prefer(detail?.referral_fee, market?.referral_fee),
     referral_fee_rate: prefer(detail?.referral_fee_rate, market?.referral_fee_rate),
+    main_image_url: mainImageUrl,
+    main_image_source: mainImageUrl ? 'mcp' : 'missing',
     seller: prefer(detail?.seller, market?.seller),
     seller_type: prefer(detail?.seller_type, market?.seller_type),
     variation_count: prefer(detail?.variation_count, market?.variation_count),
@@ -609,6 +783,7 @@ function mergeProductSnapshots(
 
 export function normalizeMcpProductData(raw: unknown): McpProductSnapshot {
   const source = productSourceFrom(raw);
+  const mainImageUrl = extractImageUrl(source) ?? extractImageUrl(raw);
 
   return {
     asin: pickString(source, ['asin', 'ASIN']),
@@ -618,7 +793,7 @@ export function normalizeMcpProductData(raw: unknown): McpProductSnapshot {
     price: pickNumber(source, ['price', 'salePrice', 'currentPrice', 'buyBoxPrice']),
     coupon_price: pickNumber(source, ['coupon_price', 'couponPrice', 'finalPrice', 'dealPrice', 'actualPrice']),
     rating: pickNumber(source, ['rating', 'ratingValue', 'stars', 'star']),
-    review_count: pickNumber(source, ['review_count', 'reviewCount', 'reviews', 'ratings', 'ratingsCount', 'ratingCount']),
+    review_count: pickNumber(source, ['ratings', 'ratingsCount', 'ratingCount', 'review_count', 'reviewCount', 'reviews']),
     bsr: pickNumber(source, ['bsr', 'bsrRank', 'bsr_rank', 'rank', 'mainBsrRank']),
     monthly_sales: pickNumber(source, ['monthly_sales', 'monthlySales', 'units', 'totalUnits', 'sales', 'monthUnits', 'amzUnit']),
     monthly_revenue: pickNumber(source, ['monthly_revenue', 'monthlyRevenue', 'revenue', 'totalAmount', 'amount', 'monthAmount', 'amzSales']),
@@ -633,6 +808,8 @@ export function normalizeMcpProductData(raw: unknown): McpProductSnapshot {
     ]),
     referral_fee: pickNumber(source, ['referral_fee', 'referralFee', 'commissionFee']),
     referral_fee_rate: pickNumber(source, ['referral_fee_rate', 'referralRate', 'commissionRate', 'categoryCommissionRate']),
+    main_image_url: mainImageUrl,
+    main_image_source: mainImageUrl ? 'mcp' : 'missing',
     seller: pickString(source, ['seller', 'sellerName', 'buyBoxSellerName', 'shopName']),
     seller_type: pickString(source, ['seller_type', 'sellerType', 'sellerCategory']),
     variation_count: countVariations(source),
@@ -767,6 +944,110 @@ export async function fetchKeywordMiner(keyword: string): Promise<McpToolCallRes
   return { ...result, data: normalizeMcpKeywordData(result.data, keyword.trim()) };
 }
 
+function successfulInsights(
+  asin: string,
+  result: McpToolCallResult<unknown>,
+  sourceTool: Parameters<typeof normalizeAsinKeywordInsights>[0]['sourceTool'],
+  product?: { title?: string | null; category?: string | null; brand?: string | null },
+): AsinKeywordInsight[] {
+  if (result.status !== 'success') return [];
+  return normalizeAsinKeywordInsights({
+    asin,
+    raw: result.data,
+    sourceTool,
+    title: product?.title,
+    category: product?.category,
+    brand: product?.brand,
+    checkedAt: result.checked_at,
+    error: result.error,
+  });
+}
+
+function previousMonthYYYYMM(): string {
+  const date = new Date();
+  date.setMonth(date.getMonth() - 1);
+  return `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function statusSummary(result: McpToolCallResult<unknown>, insights: AsinKeywordInsight[]): Record<string, unknown> {
+  const payload = asRecord(result.data);
+  const rawPayload = asRecord(result.raw);
+  const total =
+    pickNumber(payload, ['total', 'totalCount', 'count']) ??
+    pickNumber(rawPayload, ['total', 'totalCount', 'count']) ??
+    insights.length;
+  return {
+    status: result.status,
+    total,
+    items_count: insights.length,
+    error: result.error,
+  };
+}
+
+export async function fetchAsinKeywords(
+  asin: string,
+  product?: { title?: string | null; category?: string | null; brand?: string | null },
+): Promise<McpToolCallResult<AsinKeywordInsight[]>> {
+  const normalizedAsin = asin.trim();
+  const trafficKeyword = await invokeMcpTool('traffic_keyword', {
+    request: {
+      asin: normalizedAsin,
+      marketplace: DEFAULT_MARKETPLACE,
+      page: 1,
+      size: 50,
+      returnFields: asinKeywordReturnFields,
+    },
+  });
+  const trafficInsights = successfulInsights(normalizedAsin, trafficKeyword, 'traffic_keyword', product);
+  const raw: Record<string, unknown> = {
+    keyword_source: trafficInsights.length ? 'traffic_keyword' : 'traffic_keyword_empty',
+    keyword_confidence: trafficInsights.length ? 'high' : 'low',
+    traffic_keyword: trafficKeyword.raw,
+    traffic_keyword_error: trafficKeyword.error,
+    traffic_keyword_summary: statusSummary(trafficKeyword, trafficInsights),
+  };
+
+  if (trafficInsights.length) {
+    return createToolResult('asin_keywords', 'success', trafficInsights, raw, trafficKeyword.error);
+  }
+
+  const keywordOrder = await invokeMcpTool('keyword_order', {
+    request: {
+      asins: [normalizedAsin],
+      marketplace: DEFAULT_MARKETPLACE,
+      reverseType: 'M',
+      date: previousMonthYYYYMM(),
+      page: 1,
+      size: 50,
+      variation: 'Y',
+      returnFields: asinKeywordReturnFields,
+    },
+  });
+  const orderInsights = successfulInsights(normalizedAsin, keywordOrder, 'keyword_order', product);
+  raw.keyword_order = keywordOrder.raw;
+  raw.keyword_order_error = keywordOrder.error;
+  raw.keyword_order_summary = statusSummary(keywordOrder, orderInsights);
+  raw.keyword_source = orderInsights.length ? 'keyword_order' : 'title_split_fallback';
+  raw.keyword_confidence = orderInsights.length ? 'medium_high' : 'low';
+  if (!trafficInsights.length) {
+    raw.warning =
+      orderInsights.length
+        ? 'traffic_keyword 成功但未返回真实流量词，已使用 keyword_order 出单词反查兜底。'
+        : 'ASIN近30天未返回前3页流量词，出单词反查也为空，需用标题拆词兜底并前台复核。';
+  }
+
+  const insights = orderInsights;
+  const errors = [trafficKeyword.error, keywordOrder.error].filter(Boolean);
+  const anySuccess = [trafficKeyword, keywordOrder].some((result) => result.status === 'success');
+  return createToolResult(
+    'asin_keywords',
+    anySuccess ? 'success' : (trafficKeyword.status === 'timeout' || keywordOrder.status === 'timeout' ? 'timeout' : 'failed'),
+    insights,
+    raw,
+    errors.length ? errors.join(' | ') : null,
+  );
+}
+
 export async function fetchCategoryNodes(nodeIdPath?: string, marketplace = DEFAULT_MARKETPLACE): Promise<McpToolCallResult<AmazonCategoryNode[]>> {
   const result = await invokeMcpTool('product_node', {
     request: {
@@ -785,6 +1066,31 @@ export async function fetchCategoryNodes(nodeIdPath?: string, marketplace = DEFA
 export interface McpCategoryResearchResult {
   products: McpDiscoveredProduct[];
   used_category_fallback: boolean;
+  warnings: string[];
+  raw_result_count: number;
+  normalized_result_count: number;
+  filtered_result_count: number;
+  filtered_out_count: number;
+  request_params: Record<string, unknown>;
+  raw_response_summary: Record<string, unknown>;
+}
+
+export interface McpSellerLookupResult {
+  seller_id: string | null;
+  seller_name: string | null;
+  storefront_url: string | null;
+  product: McpProductSnapshot | null;
+  raw_response_summary: Record<string, unknown>;
+}
+
+export interface McpSellerResearchResult {
+  seller_id: string | null;
+  seller_name: string | null;
+  storefront_url: string | null;
+  products: McpDiscoveredProduct[];
+  raw_result_count: number;
+  request_params: Record<string, unknown>;
+  raw_response_summary: Record<string, unknown>;
   warnings: string[];
 }
 
@@ -824,9 +1130,11 @@ function normalizeCategoryResearchProducts(
   raw: unknown,
   selection: CategorySelection,
   filters: DiscoveryFilters,
+  request: Record<string, unknown>,
   warnings: string[] = [],
 ): McpCategoryResearchResult {
-  const normalized = asObjectArray(raw)
+  const rawItems = asObjectArray(raw);
+  const normalized = rawItems
     .map((item) => normalizeDiscoveredProduct(item, selection, filters.keyword_optional))
     .filter((item): item is McpDiscoveredProduct => item !== null);
   const filtered = filterProductsByListingAge(normalized, filters);
@@ -834,16 +1142,19 @@ function normalizeCategoryResearchProducts(
     products: filtered.products,
     used_category_fallback: warnings.some((warning) => warning.includes('类目名称')),
     warnings: [...warnings, ...filtered.warnings],
+    raw_result_count: rawItems.length,
+    normalized_result_count: normalized.length,
+    filtered_result_count: filtered.products.length,
+    filtered_out_count: Math.max(0, rawItems.length - filtered.products.length),
+    request_params: request,
+    raw_response_summary: summarizeMcpListResponse(raw),
   };
 }
 
-export async function productResearchByCategory(
-  selection: CategorySelection,
-  filters: DiscoveryFilters,
-): Promise<McpToolCallResult<McpCategoryResearchResult>> {
+export function buildCategoryResearchRequest(selection: CategorySelection, filters: DiscoveryFilters): Record<string, unknown> {
   const size = Math.max(1, Math.min(50, Math.round(filters.limit || 20)));
   const listingRange = effectiveListingDayRange(filters);
-  const request = {
+  return {
     marketplace: filters.marketplace || DEFAULT_MARKETPLACE,
     nodeIdPath: selection.node_id,
     nodeIdPathEqual: filters.leaf_only,
@@ -860,11 +1171,18 @@ export async function productResearchByCategory(
     variation: 'Y',
     returnFields: discoveryReturnFields,
   };
+}
+
+export async function productResearchByCategory(
+  selection: CategorySelection,
+  filters: DiscoveryFilters,
+): Promise<McpToolCallResult<McpCategoryResearchResult>> {
+  const request = buildCategoryResearchRequest(selection, filters);
   const result = await invokeMcpTool('product_research', { request });
   if (result.status === 'success') {
     return {
       ...result,
-      data: normalizeCategoryResearchProducts(result.data, selection, filters),
+      data: normalizeCategoryResearchProducts(result.data, selection, filters, request),
     };
   }
 
@@ -888,6 +1206,178 @@ export async function productResearchByCategory(
   }
   return {
     ...fallbackResult,
-    data: normalizeCategoryResearchProducts(fallbackResult.data, selection, filters, ['当前 MCP 工具未确认支持 node_id，已使用类目名称降级查询。']),
+    data: normalizeCategoryResearchProducts(
+      fallbackResult.data,
+      selection,
+      filters,
+      {
+        ...request,
+        nodeIdPath: undefined,
+        nodeIdPathEqual: undefined,
+        keyword: filters.keyword_optional.trim() || selection.name,
+      },
+      ['当前 MCP 工具未确认支持 node_id，已使用类目名称降级查询。'],
+    ),
+  };
+}
+
+export async function productResearchByMarket(params: {
+  marketplace?: string;
+  keyword?: string;
+  nodeIdPath?: string;
+  categoryPath?: string;
+  priceMin: number;
+  priceMax: number;
+  monthlySalesMin: number;
+  monthlySalesMax: number;
+  reviewCountMin: number;
+  reviewCountMax: number;
+  listedDaysMin: number;
+  listedDaysMax: number;
+  prioritizeRecent: boolean;
+  size: number;
+}): Promise<McpToolCallResult<McpCategoryResearchResult>> {
+  const keyword = (params.keyword ?? '').trim();
+  const nodeIdPath = (params.nodeIdPath ?? '').trim();
+  if (!keyword && !nodeIdPath) {
+    return createToolResult('product_research', 'failed', null, null, '请至少输入关键词或类目节点 ID。') as unknown as McpToolCallResult<McpCategoryResearchResult>;
+  }
+  const size = Math.max(1, Math.min(50, Math.round(params.size || 30)));
+  const marketplace = params.marketplace || DEFAULT_MARKETPLACE;
+  const request = {
+    marketplace,
+    nodeIdPath: nodeIdPath || undefined,
+    nodeIdPathEqual: Boolean(nodeIdPath),
+    keyword: keyword || undefined,
+    minPrice: params.priceMin,
+    maxPrice: params.priceMax,
+    minUnits: params.monthlySalesMin,
+    maxUnits: params.monthlySalesMax,
+    minRatings: params.reviewCountMin > 0 ? params.reviewCountMin : undefined,
+    maxRatings: params.reviewCountMax,
+    availableMonth: params.listedDaysMax > 0 ? Math.max(1, Math.ceil(params.listedDaysMax / 30)) : undefined,
+    size,
+    page: 1,
+    variation: 'Y',
+    returnFields: discoveryReturnFields,
+  };
+  const selection: CategorySelection = {
+    node_id: nodeIdPath || keyword || 'market-discovery',
+    name: params.categoryPath || keyword || '市场指标',
+    path: params.categoryPath || (keyword ? `关键词 > ${keyword}` : `节点 > ${nodeIdPath}`),
+    level: 0,
+    is_leaf: Boolean(nodeIdPath),
+    selected_at: nowIso(),
+  };
+  const filters: DiscoveryFilters = {
+    marketplace,
+    keyword_optional: keyword,
+    price_min: params.priceMin,
+    price_max: params.priceMax,
+    monthly_sales_min: params.monthlySalesMin,
+    monthly_sales_max: params.monthlySalesMax,
+    review_count_max: params.reviewCountMax,
+    rating_min: 3.8,
+    limit: size,
+    listing_range_days: params.listedDaysMax > 0 ? 365 : null,
+    listed_days_min: params.listedDaysMin,
+    listed_days_max: params.listedDaysMax,
+    prioritize_recent: params.prioritizeRecent,
+    strict_rating_filter_enabled: false,
+    leaf_only: Boolean(nodeIdPath),
+    exclude_history: false,
+    hide_parent_duplicates: false,
+    hide_similar_products: false,
+  };
+  const result = await invokeMcpTool('product_research', { request });
+  if (result.status !== 'success') return { ...result, data: null } as McpToolCallResult<McpCategoryResearchResult>;
+  const normalized = normalizeCategoryResearchProducts(result.data, selection, filters, request);
+  const minReview = Math.max(0, Math.round(params.reviewCountMin || 0));
+  const products = minReview > 0
+    ? normalized.products.filter((product) => product.review_count === null || product.review_count >= minReview)
+    : normalized.products;
+  return {
+    ...result,
+    data: {
+      ...normalized,
+      products,
+      filtered_result_count: products.length,
+      filtered_out_count: Math.max(0, normalized.raw_result_count - products.length),
+    },
+  };
+}
+
+export async function fetchSellerFromAsin(asin: string, marketplace = DEFAULT_MARKETPLACE): Promise<McpToolCallResult<McpSellerLookupResult>> {
+  const detail = await fetchAsinDetail(asin);
+  if (detail.status !== 'success') return { ...detail, data: null } as McpToolCallResult<McpSellerLookupResult>;
+  const rawSource = productSourceFrom(detail.raw ?? detail.data?.raw ?? detail.data);
+  const sellerName = detail.data?.seller ?? pickString(rawSource, ['sellerName', 'seller', 'shopName', 'buyBoxSellerName']);
+  const sellerId = pickString(rawSource, ['sellerId', 'seller_id', 'sellerIdStr', 'merchantId', 'merchant_id', 'shopId']);
+  const storefrontUrl =
+    pickString(rawSource, ['storefrontUrl', 'storefront_url', 'sellerUrl', 'shopUrl']) ??
+    (sellerId ? `https://www.amazon.com/sp?seller=${encodeURIComponent(sellerId)}` : null);
+
+  return {
+    ...detail,
+    data: {
+      seller_id: sellerId,
+      seller_name: sellerName,
+      storefront_url: storefrontUrl,
+      product: detail.data,
+      raw_response_summary: summarizeMcpListResponse(detail.raw ?? detail.data),
+    },
+  };
+}
+
+export async function productResearchBySeller(params: {
+  sellerName?: string;
+  sellerId?: string;
+  marketplace?: string;
+  size?: number;
+  page?: number;
+}): Promise<McpToolCallResult<McpSellerResearchResult>> {
+  const marketplace = params.marketplace || DEFAULT_MARKETPLACE;
+  const sellerKey = (params.sellerName || params.sellerId || '').trim();
+  if (!sellerKey) {
+    return createToolResult('competitor_lookup', 'failed', null, null, '请输入 seller_id 或店铺名。') as unknown as McpToolCallResult<McpSellerResearchResult>;
+  }
+  const size = Math.max(1, Math.min(50, Math.round(params.size || 30)));
+  const request = {
+    marketplace,
+    sellerName: sellerKey,
+    page: params.page || 1,
+    size,
+    variation: 'Y',
+    returnFields: discoveryReturnFields,
+  };
+  const result = await invokeMcpTool('competitor_lookup', { request });
+  if (result.status !== 'success') return { ...result, data: null } as McpToolCallResult<McpSellerResearchResult>;
+
+  const rawItems = asObjectArray(result.data);
+  const products = rawItems
+    .map((item) => normalizeSellerStoreProduct(item, sellerKey))
+    .filter((item): item is McpDiscoveredProduct => item !== null);
+  const first = rawItems[0] ?? {};
+  const sellerName = pickString(first, ['sellerName', 'seller', 'shopName']) ?? params.sellerName ?? null;
+  const sellerId = pickString(first, ['sellerId', 'seller_id', 'merchantId', 'shopId']) ?? params.sellerId ?? null;
+  const storefrontUrl =
+    pickString(first, ['storefrontUrl', 'storefront_url', 'sellerUrl', 'shopUrl']) ??
+    (sellerId ? `https://www.amazon.com/sp?seller=${encodeURIComponent(sellerId)}` : null);
+  const warnings: string[] = [];
+  if (params.sellerId && !params.sellerName) warnings.push('当前卖家精灵 MCP 未确认 seller_id 专用参数，已将 seller_id 作为 sellerName 降级查询。');
+  if (!products.length) warnings.push('当前店铺查询未返回商品，可能是店铺名不匹配、权限/额度问题，或该卖家暂无可见商品。');
+
+  return {
+    ...result,
+    data: {
+      seller_id: sellerId,
+      seller_name: sellerName,
+      storefront_url: storefrontUrl,
+      products,
+      raw_result_count: rawItems.length,
+      request_params: request,
+      raw_response_summary: summarizeMcpListResponse(result.data),
+      warnings,
+    },
   };
 }
